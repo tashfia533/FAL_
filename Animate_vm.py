@@ -19,7 +19,11 @@ st.caption(
 
 # Your FAL key must be set in .streamlit/secrets.toml as:
 # FAL_KEY = "your_api_key_here"
-FAL_API_KEY = st.secrets["FAL_KEY"]
+FAL_API_KEY = st.secrets.get("FAL_KEY")
+if not FAL_API_KEY:
+    st.error("Missing FAL_KEY. Add it in Streamlit Cloud → Settings → Secrets.")
+    st.stop()
+
 
 FAL_BASE_URL = "https://fal.run"
 
