@@ -141,18 +141,46 @@ MODEL_OPTIONS = {
 MODEL_ID_TO_LABEL = {v: k for k, v in MODEL_OPTIONS.items()}
 
 # -----------------------------
-# HISTORY RENDERING (RIGHT SIDE)
+# HISTORY PAGE RENDERING
 # -----------------------------
-def render_history_panel():
-    """Render grouped history on the right side, like tiles/cards."""
+def render_history_page():
+    st.header("📚 Generation History")
+
     history = load_history()
     if not history:
-        st.info("No history yet. Generate something on the left.")
+        st.info("No history saved yet. Generate something first on the Generator page.")
         return
 
-    # Group by model
+    # Optional filter: All models or a specific one
+    model_filter = st.selectbox(
+        "Filter by model",
+        ["All models"] + sorted({h["model"] for h in history}),
+        index=0,
+    )
+
+    # Filter by type (image / video / all)
+    kind_filter = st.selectbox(
+        "Filter by type",
+        ["All", "image", "video"],
+        index=0,
+    )
+
+    # Apply filters
+    filtered = []
+    for item in history:
+        if model_filter != "All models" and item["model"] != model_filter:
+            continue
+        if kind_filter != "All" and item["kind"] != kind_filter:
+            continue
+        filtered.append(item)
+
+    if not filtered:
+        st.info("No entries match your filters.")
+        return
+
+    # Group filtered entries by model
     grouped = defaultdict(list)
-    for entry in history:
+    for entry in filtered:
         grouped[entry["model"]].append(entry)
 
     # Zoomed item at top
@@ -161,6 +189,7 @@ def render_history_panel():
     zoom_meta = st.session_state.get("zoom_media_meta")
 
     if zoom_url:
+        st.markdown("---")
         st.subheader("🔎 Selected item")
         if zoom_kind == "image":
             st.image(zoom_url, use_column_width=True)
@@ -177,9 +206,9 @@ def render_history_panel():
             st.session_state["zoom_media_kind"] = None
             st.rerun()
 
-        st.markdown("---")
+    st.markdown("---")
 
-    # Order models by latest timestamp
+    # Order model sections by latest timestamp
     model_order = []
     for mid, entries in grouped.items():
         last_ts = max(e.get("timestamp", "") for e in entries)
@@ -191,7 +220,8 @@ def render_history_panel():
             grouped[model_id], key=lambda e: e.get("timestamp", ""), reverse=True
         )
         label = MODEL_ID_TO_LABEL.get(model_id, model_id)
-        st.markdown(f"### {label}")
+
+        st.markdown(f"## {label}")
 
         for idx, entry in enumerate(entries):
             ts = entry.get("timestamp", "")[:19].replace("T", " ")
@@ -202,6 +232,10 @@ def render_history_panel():
             st.markdown(
                 f"**Time (UTC):** {ts}  ·  **Type:** `{kind}`"
             )
+
+            if not urls:
+                st.write("_No media URLs found for this entry._")
+                continue
 
             # IMAGE TILES
             if kind == "image":
@@ -220,7 +254,8 @@ def render_history_panel():
                 cols = st.columns(min(max(len(urls), 1), 3))
                 for i, url in enumerate(urls):
                     with cols[i % len(cols)]:
-                        st.video(url)  # rendered small thanks to narrow column
+                        # Video rendered in a narrow column, so it appears as a tile
+                        st.video(url)
                         if st.button("🔍 View", key=f"zoom_vid_{model_id}_{idx}_{i}"):
                             st.session_state["zoom_media_url"] = url
                             st.session_state["zoom_media_meta"] = meta
@@ -233,22 +268,26 @@ def render_history_panel():
         st.markdown("---")
 
 
+# -----------------------------
+# SIDEBAR NAV
+# -----------------------------
+page = st.sidebar.radio("Page", ["Generator", "History"], index=0)
+
+# -----------------------------
+# HISTORY PAGE
+# -----------------------------
+if page == "History":
+    render_history_page()
+    st.stop()   # don't render generator below
+
+
 # =============================
-# MAIN LAYOUT (ONE PAGE)
+# GENERATOR PAGE
 # =============================
 
+# Layout for generator
 left, right = st.columns([1, 1])
 
-# RIGHT: result + (later) history
-with right:
-    st.header("🧾 Result")
-    output_area = st.empty()
-    extra_info = st.empty()
-    st.markdown("---")
-    st.header("📚 History")
-    history_container = st.container()   # we'll fill this after run logic
-
-# LEFT: generator UI
 with left:
     st.header("⚙️ Input & Settings")
 
@@ -770,6 +809,12 @@ with left:
             help="If true, the safety checker is enabled (recommended).",
         )
 
+# RIGHT COLUMN: result only
+with right:
+    st.header("🧾 Result")
+    output_area = st.empty()
+    extra_info = st.empty()
+
 # -----------------------------
 # RUN LOGIC
 # -----------------------------
@@ -1132,9 +1177,4 @@ if run_btn:
         st.error("Something went wrong while calling the FAL API.")
         st.code(str(e))
 
-# -----------------------------
-# RENDER HISTORY (AFTER RUN)
-# -----------------------------
-with history_container:
-    render_history_panel()
 
