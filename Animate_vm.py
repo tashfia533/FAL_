@@ -4,6 +4,7 @@ import base64
 import os
 import json
 from datetime import datetime, timezone
+
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -26,9 +27,16 @@ if not FAL_API_KEY:
     st.error("Missing FAL_KEY. Add it in Streamlit Cloud → Settings → Secrets.")
     st.stop()
 
-
 FAL_BASE_URL = "https://fal.run"
 HISTORY_FILE = "history.json"   # JSON "database"
+
+# -----------------------------
+# ZOOM STATE (for History view)
+# -----------------------------
+if "zoom_image_url" not in st.session_state:
+    st.session_state["zoom_image_url"] = None
+if "zoom_image_meta" not in st.session_state:
+    st.session_state["zoom_image_meta"] = None
 
 # -----------------------------
 # HISTORY HELPERS
@@ -168,7 +176,7 @@ if page == "History":
         if not filtered:
             st.info("No entries match your filters.")
         else:
-            for entry in filtered:
+            for idx, entry in enumerate(filtered):
                 st.markdown("---")
                 ts = entry.get("timestamp", "")[:19].replace("T", " ")
                 st.markdown(
@@ -177,12 +185,19 @@ if page == "History":
                     f"**Time (UTC):** {ts}"
                 )
 
-                # Show media
                 urls = entry.get("urls", [])
+
+                # Thumbnails with click-to-zoom for images
                 if entry["kind"] == "image":
                     cols = st.columns(min(len(urls), 4))
                     for i, url in enumerate(urls):
-                        cols[i % len(cols)].image(url, use_column_width=True)
+                        with cols[i % len(cols)]:
+                            st.image(url, width=200, caption=f"Image {i+1}")
+                            if st.button("🔍 View larger", key=f"zoom_{idx}_{i}"):
+                                st.session_state["zoom_image_url"] = url
+                                st.session_state["zoom_image_meta"] = entry.get("meta", {})
+
+                # Videos as usual
                 elif entry["kind"] == "video":
                     for url in urls:
                         st.video(url)
@@ -190,6 +205,22 @@ if page == "History":
                 # Show meta as expandable JSON
                 with st.expander("Details"):
                     st.json(entry.get("meta", {}))
+
+        # Big zoomed image viewer at the bottom
+        zoom_url = st.session_state.get("zoom_image_url")
+        if zoom_url:
+            st.markdown("---")
+            st.subheader("🔎 Zoomed image")
+            st.image(zoom_url, use_column_width=True)
+
+            if st.session_state.get("zoom_image_meta"):
+                with st.expander("Details for this image"):
+                    st.json(st.session_state["zoom_image_meta"])
+
+            if st.button("Clear selection"):
+                st.session_state["zoom_image_url"] = None
+                st.session_state["zoom_image_meta"] = None
+                st.rerun()
 
     st.stop()  # don't render the generator page
 
@@ -1092,4 +1123,3 @@ if run_btn:
     except Exception as e:
         st.error("Something went wrong while calling the FAL API.")
         st.code(str(e))
-
