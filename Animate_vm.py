@@ -17,7 +17,7 @@ st.set_page_config(
 st.title("Multi-Model Media Platform")
 
 st.caption(
-    "Switch between different models to Edit in one UI, "
+    "Switch between different models in one UI, "
     "configure settings, and call the FAL API directly."
 )
 
@@ -32,7 +32,7 @@ FAL_BASE_URL = "https://fal.run"
 HISTORY_FILE = "history.json"   # JSON "database"
 
 # -----------------------------
-# ZOOM STATE (for History view)
+# ZOOM STATE (for History page)
 # -----------------------------
 if "zoom_media_url" not in st.session_state:
     st.session_state["zoom_media_url"] = None
@@ -141,31 +141,43 @@ MODEL_OPTIONS = {
 MODEL_ID_TO_LABEL = {v: k for k, v in MODEL_OPTIONS.items()}
 
 # -----------------------------
-# HISTORY PAGE RENDERING
+# SIDEBAR NAV (Generator | History)
+# -----------------------------
+page = st.sidebar.radio(
+    "Page",
+    ["Generator", "History"],
+    horizontal=True,  # <- side-by-side in sidebar
+)
+
+# -----------------------------
+# HISTORY PAGE (separate page)
 # -----------------------------
 def render_history_page():
-    st.header("📚 Generation History")
+    st.header("📚 History")
 
     history = load_history()
     if not history:
-        st.info("No history saved yet. Generate something first on the Generator page.")
+        st.info("No history saved yet. Generate something on the Generator page.")
         return
 
-    # Optional filter: All models or a specific one
+    # Newest first
+    history = list(reversed(history))
+
+    # Filters
     model_filter = st.selectbox(
-        "Filter by model",
+        "Model",
         ["All models"] + sorted({h["model"] for h in history}),
         index=0,
+        key="hist_model_filter",
     )
 
-    # Filter by type (image / video / all)
     kind_filter = st.selectbox(
-        "Filter by type",
+        "Type",
         ["All", "image", "video"],
         index=0,
+        key="hist_kind_filter",
     )
 
-    # Apply filters
     filtered = []
     for item in history:
         if model_filter != "All models" and item["model"] != model_filter:
@@ -175,38 +187,13 @@ def render_history_page():
         filtered.append(item)
 
     if not filtered:
-        st.info("No entries match your filters.")
+        st.info("No entries match these filters.")
         return
 
-    # Group filtered entries by model
+    # Group by model
     grouped = defaultdict(list)
     for entry in filtered:
         grouped[entry["model"]].append(entry)
-
-    # Zoomed item at top
-    zoom_url = st.session_state.get("zoom_media_url")
-    zoom_kind = st.session_state.get("zoom_media_kind")
-    zoom_meta = st.session_state.get("zoom_media_meta")
-
-    if zoom_url:
-        st.markdown("---")
-        st.subheader("🔎 Selected item")
-        if zoom_kind == "image":
-            st.image(zoom_url, use_column_width=True)
-        elif zoom_kind == "video":
-            st.video(zoom_url)
-
-        if zoom_meta:
-            with st.expander("Details"):
-                st.json(zoom_meta)
-
-        if st.button("Close", key="close_zoom"):
-            st.session_state["zoom_media_url"] = None
-            st.session_state["zoom_media_meta"] = None
-            st.session_state["zoom_media_kind"] = None
-            st.rerun()
-
-    st.markdown("---")
 
     # Order model sections by latest timestamp
     model_order = []
@@ -221,61 +208,74 @@ def render_history_page():
         )
         label = MODEL_ID_TO_LABEL.get(model_id, model_id)
 
-        st.markdown(f"## {label}")
+        # One expandable section per model
+        with st.expander(label, expanded=False):
+            image_items = []
+            video_items = []
 
-        for idx, entry in enumerate(entries):
-            ts = entry.get("timestamp", "")[:19].replace("T", " ")
-            kind = entry.get("kind", "")
-            urls = entry.get("urls", [])
-            meta = entry.get("meta", {})
+            # Flatten all medias for that model
+            for entry in entries:
+                kind = entry.get("kind")
+                meta = entry.get("meta", {})
+                for url in entry.get("urls", []):
+                    if kind == "image":
+                        image_items.append((url, meta))
+                    elif kind == "video":
+                        video_items.append((url, meta))
 
-            st.markdown(
-                f"**Time (UTC):** {ts}  ·  **Type:** `{kind}`"
-            )
+            # Limit how many show to keep UI light
+            image_items = image_items[:24]
+            video_items = video_items[:12]
 
-            if not urls:
-                st.write("_No media URLs found for this entry._")
-                continue
-
-            # IMAGE TILES
-            if kind == "image":
-                cols = st.columns(min(max(len(urls), 1), 4))
-                for i, url in enumerate(urls):
-                    with cols[i % len(cols)]:
-                        st.image(url, width=180)
-                        if st.button("🔍 View", key=f"zoom_img_{model_id}_{idx}_{i}"):
+            if image_items:
+                st.markdown("**Images**")
+                img_cols = st.columns(4)
+                for i, (url, meta) in enumerate(image_items):
+                    with img_cols[i % 4]:
+                        st.image(url, width=150)
+                        if st.button("🔍", key=f"hist_img_{model_id}_{i}"):
                             st.session_state["zoom_media_url"] = url
                             st.session_state["zoom_media_meta"] = meta
                             st.session_state["zoom_media_kind"] = "image"
                             st.rerun()
 
-            # VIDEO TILES
-            elif kind == "video":
-                cols = st.columns(min(max(len(urls), 1), 3))
-                for i, url in enumerate(urls):
-                    with cols[i % len(cols)]:
-                        # Video rendered in a narrow column, so it appears as a tile
+            if video_items:
+                st.markdown("**Videos**")
+                vid_cols = st.columns(3)
+                for i, (url, meta) in enumerate(video_items):
+                    with vid_cols[i % 3]:
                         st.video(url)
-                        if st.button("🔍 View", key=f"zoom_vid_{model_id}_{idx}_{i}"):
+                        if st.button("🔍", key=f"hist_vid_{model_id}_{i}"):
                             st.session_state["zoom_media_url"] = url
                             st.session_state["zoom_media_meta"] = meta
                             st.session_state["zoom_media_kind"] = "video"
                             st.rerun()
 
-            with st.expander("Details"):
-                st.json(meta)
+    # Zoomed view at bottom
+    zoom_url = st.session_state.get("zoom_media_url")
+    zoom_kind = st.session_state.get("zoom_media_kind")
+    zoom_meta = st.session_state.get("zoom_media_meta")
 
+    if zoom_url:
         st.markdown("---")
+        st.subheader("🔎 Selected item")
+
+        if zoom_kind == "image":
+            st.image(zoom_url, use_column_width=True)
+        elif zoom_kind == "video":
+            st.video(zoom_url)
+
+        if zoom_meta:
+            with st.expander("Details"):
+                st.json(zoom_meta)
+
+        if st.button("Close"):
+            st.session_state["zoom_media_url"] = None
+            st.session_state["zoom_media_meta"] = None
+            st.session_state["zoom_media_kind"] = None
+            st.rerun()
 
 
-# -----------------------------
-# SIDEBAR NAV
-# -----------------------------
-page = st.sidebar.radio("Page", ["Generator", "History"], index=0)
-
-# -----------------------------
-# HISTORY PAGE
-# -----------------------------
 if page == "History":
     render_history_page()
     st.stop()   # don't render generator below
@@ -285,9 +285,12 @@ if page == "History":
 # GENERATOR PAGE
 # =============================
 
-# Layout for generator
+# two columns: left = controls, right = result
 left, right = st.columns([1, 1])
 
+# -----------------------------
+# LEFT COLUMN – CONTROLS
+# -----------------------------
 with left:
     st.header("⚙️ Input & Settings")
 
@@ -571,7 +574,7 @@ with left:
             "Enhance Prompt Mode",
             ["standard"],
             index=0,
-            help="Prompt enhancement setting. Currently using 'standard' as in the FAL UI.",
+            help="Prompt enhancement setting. Currently using 'standard'.",
         )
 
         sd_output_format = st.selectbox(
@@ -660,7 +663,7 @@ with left:
             "Enhance Prompt Mode",
             ["standard"],
             index=0,
-            help="Prompt enhancement setting. Currently using 'standard' as in the FAL UI.",
+            help="Prompt enhancement setting. Currently using 'standard'.",
         )
 
         sd_output_format = st.selectbox(
@@ -713,7 +716,7 @@ with left:
             min_value=1,
             max_value=10,
             value=1,
-            help="Upper bound of variations per generation (total images ≤ num_images × max_images).",
+            help="Upper bound of variations per generation.",
         )
 
         sd45_seed = st.number_input(
@@ -750,7 +753,7 @@ with left:
             "Upload Image(s) to Edit",
             type=["png", "jpg", "jpeg", "webp", "avif"],
             accept_multiple_files=True,
-            help="Upload up to 10 images. The model can reference them as 'Figure 1', 'Figure 2', etc.",
+            help="Upload up to 10 images. The model can reference them as 'Figure 1', etc.",
         )
 
         st.markdown("### Image Size")
@@ -786,7 +789,7 @@ with left:
             min_value=1,
             max_value=10,
             value=1,
-            help="Upper bound of images per generation. Total images ≤ num_images × max_images.",
+            help="Upper bound of images per generation.",
         )
 
         sd45_seed = st.number_input(
@@ -809,7 +812,9 @@ with left:
             help="If true, the safety checker is enabled (recommended).",
         )
 
-# RIGHT COLUMN: result only
+# -----------------------------
+# RIGHT COLUMN – RESULT
+# -----------------------------
 with right:
     st.header("🧾 Result")
     output_area = st.empty()
@@ -822,7 +827,7 @@ if run_btn:
     try:
         with st.spinner("Calling FAL API…"):
 
-            # ------- WAN ANIMATE -------
+            # WAN ANIMATE
             if selected_model_id == "fal-ai/wan/v2.2-14b/animate/move":
                 if not video_file or not image_file:
                     st.error("Please upload both a video and an image.")
@@ -880,7 +885,7 @@ if run_btn:
                 else:
                     st.error("No video URL returned from WAN model.")
 
-            # ------- NANO BANANA PRO (T2I) -------
+            # NANO BANANA PRO
             elif selected_model_id == "fal-ai/nano-banana-pro":
                 if not prompt.strip():
                     st.error("Please enter a prompt.")
@@ -923,7 +928,7 @@ if run_btn:
                         },
                     )
 
-            # ------- NANO BANANA PRO EDIT (I2I) -------
+            # NANO BANANA PRO EDIT
             elif selected_model_id == "fal-ai/nano-banana-pro/edit":
                 if not edit_prompt.strip():
                     st.error("Please enter an edit prompt.")
@@ -973,7 +978,7 @@ if run_btn:
                         },
                     )
 
-            # ------- SEEDREAM 4.0 (T2I) -------
+            # SEEDREAM 4.0 T2I
             elif selected_model_id == "fal-ai/bytedance/seedream/v4/text-to-image":
                 if not sd_prompt.strip():
                     st.error("Please enter a prompt.")
@@ -1023,7 +1028,7 @@ if run_btn:
                         },
                     )
 
-            # ------- SEEDREAM 4.0 EDIT (I2I) -------
+            # SEEDREAM 4.0 EDIT
             elif selected_model_id == "fal-ai/bytedance/seedream/v4/edit":
                 if not sd_edit_prompt.strip():
                     st.error("Please enter an edit prompt.")
@@ -1080,7 +1085,7 @@ if run_btn:
                         },
                     )
 
-            # ------- SEEDREAM 4.5 (T2I) -------
+            # SEEDREAM 4.5 T2I
             elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/text-to-image":
                 if not sd45_prompt.strip():
                     st.error("Please enter a prompt.")
@@ -1123,7 +1128,7 @@ if run_btn:
                         meta={"prompt": sd45_prompt.strip(), "image_size": sd45_image_size},
                     )
 
-            # ------- SEEDREAM 4.5 EDIT (I2I) -------
+            # SEEDREAM 4.5 EDIT
             elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/edit":
                 if not sd45_edit_prompt.strip():
                     st.error("Please enter an edit prompt.")
