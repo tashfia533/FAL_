@@ -31,7 +31,6 @@ MAX_HISTORY_ITEMS = 500  # prevent history.json from growing forever
 st.markdown(
     """
 <style>
-/* Tile grid */
 .tile-wrap {
   border: 1px solid rgba(255,255,255,0.10);
   border-radius: 14px;
@@ -57,7 +56,7 @@ hr.soft { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 12
 )
 
 # -----------------------------
-# ZOOM STATE (shared)
+# ZOOM STATE
 # -----------------------------
 if "zoom_media_url" not in st.session_state:
     st.session_state["zoom_media_url"] = None
@@ -79,6 +78,7 @@ def load_history():
     except Exception:
         return []
 
+
 def save_history(history):
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -86,14 +86,18 @@ def save_history(history):
     except Exception as e:
         st.warning(f"Could not save history: {e}")
 
+
 def add_history_item(kind, model_id, urls, meta):
+    """
+    kind is kept for logic ("image" | "video") but we won't display it on the UI.
+    """
     if not urls:
         return
     history = load_history()
     history.append(
         {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "kind": kind,           # kept for logic, but NOT displayed (per your request)
+            "timestamp": datetime.now(timezone.utc).isoformat(),  # stored only
+            "kind": kind,  # stored only
             "model": model_id,
             "urls": urls,
             "meta": meta or {},
@@ -103,15 +107,17 @@ def add_history_item(kind, model_id, urls, meta):
         history = history[-MAX_HISTORY_ITEMS:]
     save_history(history)
 
+
 def group_history(history):
     """
-    Returns: dict(model_id -> list[entry]) newest-first within each model
+    Returns dict(model_id -> list[entry]) newest-first within each model.
     """
     grouped = {}
     for entry in reversed(history):  # newest first
         mid = entry.get("model", "unknown")
         grouped.setdefault(mid, []).append(entry)
     return grouped
+
 
 # -----------------------------
 # FAL HELPERS
@@ -124,6 +130,7 @@ def file_to_data_uri(uploaded_file) -> str:
     mime = uploaded_file.type or "application/octet-stream"
     return f"data:{mime};base64,{b64}"
 
+
 def call_fal_model(model_id: str, payload: dict) -> dict:
     url = f"{FAL_BASE_URL}/{model_id}"
     headers = {"Authorization": f"Key {FAL_API_KEY}", "Content-Type": "application/json"}
@@ -131,6 +138,7 @@ def call_fal_model(model_id: str, payload: dict) -> dict:
     if resp.status_code != 200:
         raise RuntimeError(f"FAL API error {resp.status_code}: {resp.text[:800]}")
     return resp.json()
+
 
 # -----------------------------
 # MODEL OPTIONS
@@ -147,6 +155,7 @@ MODEL_OPTIONS = {
 }
 MODEL_ID_TO_LABEL = {v: k for k, v in MODEL_OPTIONS.items()}
 
+
 # -----------------------------
 # SIDEBAR NAV (Generator | History side-by-side)
 # -----------------------------
@@ -159,6 +168,7 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
+
 # -----------------------------
 # RENDER HELPERS (Tiles + Zoom)
 # -----------------------------
@@ -168,44 +178,40 @@ def set_zoom(url, kind, meta):
     st.session_state["zoom_media_meta"] = meta or {}
     st.rerun()
 
-def render_zoom_block(container):
+
+def render_zoom_block():
     url = st.session_state.get("zoom_media_url")
     kind = st.session_state.get("zoom_media_kind")
     if not url:
         return
 
-    with container:
-        st.markdown('<hr class="soft">', unsafe_allow_html=True)
-        st.subheader("🔎 Preview")
+    st.markdown('<hr class="soft">', unsafe_allow_html=True)
+    st.subheader("🔎 Preview")
 
-        if kind == "image":
-            st.image(url, use_container_width=True)
-        else:
-            st.video(url)
+    if kind == "image":
+        st.image(url, use_container_width=True)
+    else:
+        st.video(url)
 
-        meta = st.session_state.get("zoom_media_meta") or {}
-        if meta:
-            with st.expander("Details"):
-                st.json(meta)
+    meta = st.session_state.get("zoom_media_meta") or {}
+    if meta:
+        with st.expander("Details"):
+            st.json(meta)
 
-        cols = st.columns([1, 1, 2])
-        with cols[0]:
-            if st.button("Close preview"):
-                st.session_state["zoom_media_url"] = None
-                st.session_state["zoom_media_kind"] = None
-                st.session_state["zoom_media_meta"] = None
-                st.rerun()
+    cols = st.columns([1, 3])
+    with cols[0]:
+        if st.button("Close preview"):
+            st.session_state["zoom_media_url"] = None
+            st.session_state["zoom_media_kind"] = None
+            st.session_state["zoom_media_meta"] = None
+            st.rerun()
 
-def render_history_tiles(grouped, *, max_tiles_per_model=12, tile_cols=3):
-    """
-    grouped: dict(model_id -> list[entry]) newest-first
-    Shows tiles, and a View button to zoom.
-    """
+
+def render_history_tiles(grouped, *, max_tiles_per_model=60, tile_cols=4):
     for model_id, entries in grouped.items():
         label = MODEL_ID_TO_LABEL.get(model_id, model_id)
         st.markdown(f"<div class='section-title'><b>{label}</b></div>", unsafe_allow_html=True)
 
-        # Flatten urls as tiles (newest-first)
         tiles = []
         for entry in entries:
             kind = entry.get("kind", "image")
@@ -227,33 +233,32 @@ def render_history_tiles(grouped, *, max_tiles_per_model=12, tile_cols=3):
             with cols[i % tile_cols]:
                 st.markdown("<div class='tile-wrap'>", unsafe_allow_html=True)
 
-                # Thumbnail
+                # thumbnail
                 if kind == "image":
                     st.markdown(f"<img class='thumb' src='{url}' />", unsafe_allow_html=True)
                 else:
-                    # Small fixed-height tile; click View for full player
                     st.markdown(
                         f"<video class='thumb' src='{url}' muted loop playsinline></video>",
                         unsafe_allow_html=True,
                     )
 
-                # Tiny hint (optional)
+                # small prompt preview (optional)
                 prompt = (meta.get("prompt") or meta.get("edit_prompt") or "").strip()
                 if prompt:
                     st.markdown(
-                        f"<div class='small-muted'>{prompt[:60]}{'…' if len(prompt) > 60 else ''}</div>",
+                        f"<div class='small-muted'>{prompt[:70]}{'…' if len(prompt) > 70 else ''}</div>",
                         unsafe_allow_html=True,
                     )
                 else:
                     st.markdown("<div class='small-muted'>&nbsp;</div>", unsafe_allow_html=True)
 
-                # View button
                 if st.button("View", key=f"view_{model_id}_{i}_{kind}"):
                     set_zoom(url, kind, meta)
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown('<hr class="soft">', unsafe_allow_html=True)
+
 
 # -----------------------------
 # HISTORY PAGE
@@ -266,7 +271,7 @@ if page == "History":
         st.info("No history saved yet. Generate something first.")
         st.stop()
 
-    # Optional: filter by model (kept simple)
+    # filter by model (optional)
     all_models = sorted({h.get("model", "unknown") for h in history})
     filter_label = st.selectbox(
         "Filter by model",
@@ -274,7 +279,6 @@ if page == "History":
     )
 
     if filter_label != "All models":
-        # map label back to id
         wanted_id = None
         for mid in all_models:
             if MODEL_ID_TO_LABEL.get(mid, mid) == filter_label:
@@ -283,43 +287,25 @@ if page == "History":
         history = [h for h in history if h.get("model") == wanted_id]
 
     grouped = group_history(history)
-
-    # Full history: more tiles per model
     render_history_tiles(grouped, max_tiles_per_model=60, tile_cols=4)
-
-    render_zoom_block(st.container())
+    render_zoom_block()
     st.stop()
 
+
 # -----------------------------
-# GENERATOR PAGE (Left: inputs, Right: result + history panel)
+# GENERATOR PAGE (NO history shown here)
 # -----------------------------
 selected_model_label = st.selectbox("Choose model", list(MODEL_OPTIONS.keys()))
 selected_model_id = MODEL_OPTIONS[selected_model_label]
 
 st.write("---")
-
 left, right = st.columns([1, 1])
 
-# Right side: Result + History (like your reference)
 with right:
     st.header("Result")
     output_area = st.empty()
     extra_info = st.empty()
 
-    st.markdown('<hr class="soft">', unsafe_allow_html=True)
-    st.subheader("History (quick view)")
-
-    # show grouped-by-model, but fewer tiles
-    history_now = load_history()
-    if history_now:
-        grouped_now = group_history(history_now)
-        render_history_tiles(grouped_now, max_tiles_per_model=8, tile_cols=3)
-    else:
-        st.caption("No history yet.")
-
-    render_zoom_block(st.container())
-
-# Left side: inputs
 with left:
     st.header("Input & Settings")
 
@@ -333,26 +319,17 @@ with left:
     # ---------------- WAN ANIMATE ----------------
     if selected_model_id == "fal-ai/wan/v2.2-14b/animate/move":
         st.subheader("WAN Animate – Video + Image → Animated Video")
-
-        video_file = st.file_uploader(
-            "Upload Source Video",
-            type=["mp4", "mov", "webm", "m4v", "gif"],
-        )
-        image_file = st.file_uploader(
-            "Upload Reference Image",
-            type=["png", "jpg", "jpeg", "webp", "gif", "avif"],
-        )
+        video_file = st.file_uploader("Upload Source Video", type=["mp4", "mov", "webm", "m4v", "gif"])
+        image_file = st.file_uploader("Upload Reference Image", type=["png", "jpg", "jpeg", "webp", "gif", "avif"])
 
         use_turbo = st.checkbox("Use Turbo", value=True)
         guidance_scale = st.slider("Guidance Scale", 0.0, 20.0, 1.0, 0.1)
         resolution = st.selectbox("Resolution", ["480p", "580p", "720p"], index=0)
-
         seed = st.number_input("Seed", min_value=0, max_value=2_147_483_647, value=1234)
         steps = st.number_input("Num Inference Steps", min_value=1, max_value=250, value=20)
 
         enable_safety = st.checkbox("Enable Safety Checker", value=True)
         enable_output_safety = st.checkbox("Enable Output Safety Checker", value=True)
-
         shift = st.slider("Shift", 1.0, 10.0, 5.0, 0.1)
         video_quality = st.selectbox("Video Quality", ["low", "medium", "high", "maximum"], index=2)
         video_mode = st.selectbox("Video Write Mode", ["fast", "balanced", "small"], index=1)
@@ -361,7 +338,6 @@ with left:
     # ---------------- NANO BANANA T2I ----------------
     elif selected_model_id == "fal-ai/nano-banana-pro":
         st.subheader("Nano Banana Pro – Text → Image")
-
         prompt = st.text_area("Prompt", height=120)
         aspect_ratio = st.selectbox(
             "Aspect Ratio",
@@ -376,7 +352,6 @@ with left:
     # ---------------- NANO BANANA EDIT ----------------
     elif selected_model_id == "fal-ai/nano-banana-pro/edit":
         st.subheader("Nano Banana Pro Edit – Image + Text → Image")
-
         edit_prompt = st.text_area("Edit Prompt", height=120)
         edit_images = st.file_uploader(
             "Upload Image(s) to Edit",
@@ -395,11 +370,9 @@ with left:
     # ---------------- SEEDREAM 4.0 T2I ----------------
     elif selected_model_id == "fal-ai/bytedance/seedream/v4/text-to-image":
         st.subheader("Seedream 4.0 – Text → Image")
-
         sd_prompt = st.text_area("Prompt", height=120)
         sd_width = st.number_input("Width (px)", 512, 4096, 1280, 64)
         sd_height = st.number_input("Height (px)", 512, 4096, 1280, 64)
-
         sd_num_images = st.slider("Num Images", 1, 4, 1)
         sd_max_images = st.number_input("Max Images", 1, 8, 4)
         sd_seed = st.number_input("Seed (0=random)", 0, 2_147_483_647, 0)
@@ -411,7 +384,6 @@ with left:
     # ---------------- SEEDREAM 4.0 EDIT ----------------
     elif selected_model_id == "fal-ai/bytedance/seedream/v4/edit":
         st.subheader("Seedream 4.0 – Edit (Image + Text → Image)")
-
         sd_edit_prompt = st.text_area("Edit Prompt", height=120)
         sd_edit_images = st.file_uploader(
             "Upload Image(s) to Edit",
@@ -420,7 +392,6 @@ with left:
         )
         sd_width = st.number_input("Width (px)", 512, 4096, 1280, 64)
         sd_height = st.number_input("Height (px)", 512, 4096, 1280, 64)
-
         sd_num_images = st.slider("Num Images", 1, 4, 1)
         sd_max_images = st.number_input("Max Images", 1, 8, 4)
         sd_seed = st.number_input("Seed (0=random)", 0, 2_147_483_647, 0)
@@ -432,7 +403,6 @@ with left:
     # ---------------- SEEDREAM 4.5 T2I ----------------
     elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/text-to-image":
         st.subheader("Seedream 4.5 – Text → Image")
-
         sd45_prompt = st.text_area("Prompt", height=120)
         sd45_image_size = st.selectbox(
             "Image Size",
@@ -448,7 +418,6 @@ with left:
     # ---------------- SEEDREAM 4.5 EDIT ----------------
     elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/edit":
         st.subheader("Seedream 4.5 – Edit (Image + Text → Image)")
-
         sd45_edit_prompt = st.text_area("Edit Prompt", height=120)
         sd45_edit_images = st.file_uploader(
             "Upload Image(s) to Edit",
@@ -469,7 +438,6 @@ with left:
     # ---------------- FLUX Kontext Max Multi ----------------
     elif selected_model_id == "fal-ai/flux-pro/kontext/max/multi":
         st.subheader("FLUX Kontext Max Multi – Multi-image edit (Image + Text → Image)")
-
         flux_prompt = st.text_area("Prompt", height=120, placeholder="Put the little duckling on top of the woman's t-shirt.")
         flux_images = st.file_uploader(
             "Upload Image(s)",
@@ -477,17 +445,13 @@ with left:
             accept_multiple_files=True,
             help="Upload 1–4 images (the model requires image_urls).",
         )
-
         flux_seed = st.number_input("Seed (0=random)", 0, 2_147_483_647, 0)
         flux_guidance = st.slider("Guidance scale (CFG)", 1.0, 20.0, 3.5, 0.1)
         flux_sync_mode = st.checkbox("Sync Mode", value=False)
-
         flux_num_images = st.slider("Num Images", 1, 4, 1)
         flux_output_format = st.selectbox("Output Format", ["jpeg", "png"], index=0)
-
         flux_safety_tol = st.selectbox("Safety Tolerance (API only)", ["1", "2", "3", "4", "5", "6"], index=1)
         flux_enhance = st.checkbox("Enhance Prompt", value=False)
-
         flux_aspect = st.selectbox(
             "Aspect Ratio",
             ["(auto)", "21:9", "16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16", "9:21"],
@@ -524,19 +488,14 @@ if run_btn:
                 }
 
                 result = call_fal_model(selected_model_id, payload)
-
                 video_url = (result.get("video") or {}).get("url")
-                if video_url:
-                    output_area.video(video_url)
-                    add_history_item(
-                        kind="video",
-                        model_id=selected_model_id,
-                        urls=[video_url],
-                        meta={"prompt": "WAN Animate", "seed": result.get("seed")},
-                    )
-                    st.rerun()
-                else:
+                if not video_url:
                     st.error("No video URL returned from WAN model.")
+                    st.stop()
+
+                output_area.video(video_url)
+                add_history_item(kind="video", model_id=selected_model_id, urls=[video_url], meta={"prompt": "WAN Animate"})
+                st.success("Saved to history.")
 
             # Nano Banana Pro T2I
             elif selected_model_id == "fal-ai/nano-banana-pro":
@@ -555,22 +514,17 @@ if run_btn:
 
                 result = call_fal_model(selected_model_id, payload)
                 images = result.get("images") or []
-                if not images:
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
                     st.error("No images returned.")
                     st.stop()
 
-                urls = [img.get("url") for img in images if img.get("url")]
                 cols = st.columns(min(len(urls), 2))
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={"prompt": prompt.strip(), "aspect_ratio": aspect_ratio, "resolution": resolution},
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": prompt.strip()})
+                st.success("Saved to history.")
 
             # Nano Banana Pro Edit
             elif selected_model_id == "fal-ai/nano-banana-pro/edit":
@@ -581,10 +535,9 @@ if run_btn:
                     st.error("Please upload at least one image.")
                     st.stop()
 
-                image_urls = [file_to_data_uri(f) for f in edit_images]
                 payload = {
                     "prompt": edit_prompt.strip(),
-                    "image_urls": image_urls,
+                    "image_urls": [file_to_data_uri(f) for f in edit_images],
                     "num_images": int(num_images),
                     "resolution": resolution,
                     "output_format": output_format,
@@ -603,13 +556,8 @@ if run_btn:
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={"prompt": edit_prompt.strip(), "resolution": resolution},
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": edit_prompt.strip()})
+                st.success("Saved to history.")
 
             # Seedream 4.0 T2I
             elif selected_model_id == "fal-ai/bytedance/seedream/v4/text-to-image":
@@ -641,13 +589,8 @@ if run_btn:
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={"prompt": sd_prompt.strip(), "image_size": {"width": int(sd_width), "height": int(sd_height)}},
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": sd_prompt.strip()})
+                st.success("Saved to history.")
 
             # Seedream 4.0 Edit
             elif selected_model_id == "fal-ai/bytedance/seedream/v4/edit":
@@ -683,13 +626,8 @@ if run_btn:
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={"prompt": sd_edit_prompt.strip(), "image_size": {"width": int(sd_width), "height": int(sd_height)}},
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": sd_edit_prompt.strip()})
+                st.success("Saved to history.")
 
             # Seedream 4.5 T2I
             elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/text-to-image":
@@ -719,13 +657,8 @@ if run_btn:
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={"prompt": sd45_prompt.strip(), "image_size": sd45_image_size},
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": sd45_prompt.strip()})
+                st.success("Saved to history.")
 
             # Seedream 4.5 Edit
             elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/edit":
@@ -759,13 +692,8 @@ if run_btn:
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={"prompt": sd45_edit_prompt.strip(), "image_size": sd45_image_size},
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": sd45_edit_prompt.strip()})
+                st.success("Saved to history.")
 
             # FLUX Kontext Max Multi
             elif selected_model_id == "fal-ai/flux-pro/kontext/max/multi":
@@ -776,10 +704,9 @@ if run_btn:
                     st.error("Please upload at least one image (this model requires image_urls).")
                     st.stop()
 
-                image_urls = [file_to_data_uri(f) for f in flux_images]
                 payload = {
                     "prompt": flux_prompt.strip(),
-                    "image_urls": image_urls,
+                    "image_urls": [file_to_data_uri(f) for f in flux_images],
                     "guidance_scale": float(flux_guidance),
                     "sync_mode": bool(flux_sync_mode),
                     "num_images": int(flux_num_images),
@@ -803,20 +730,8 @@ if run_btn:
                 for i, u in enumerate(urls):
                     cols[i % len(cols)].image(u, use_container_width=True)
 
-                add_history_item(
-                    kind="image",
-                    model_id=selected_model_id,
-                    urls=urls,
-                    meta={
-                        "prompt": flux_prompt.strip(),
-                        "guidance_scale": float(flux_guidance),
-                        "aspect_ratio": None if flux_aspect == "(auto)" else flux_aspect,
-                        "output_format": flux_output_format,
-                        "num_images": int(flux_num_images),
-                        "safety_tolerance": flux_safety_tol,
-                    },
-                )
-                st.rerun()
+                add_history_item(kind="image", model_id=selected_model_id, urls=urls, meta={"prompt": flux_prompt.strip()})
+                st.success("Saved to history.")
 
     except Exception as e:
         st.error("Something went wrong while calling the FAL API.")
