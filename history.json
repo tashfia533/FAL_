@@ -1,0 +1,26 @@
+[
+  {
+    "timestamp": "2025-12-18T10:26:41.188927+00:00",
+    "model_label": "Nano Banana Pro (Text → Image)",
+    "model": "fal-ai/nano-banana-pro",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a86c8ad/QzFpSgjwd7DI-ypLcoD-K.png"
+    ],
+    "meta": {
+      "prompt": "a person walking through the desert drinking a cold drink"
+    }
+  },
+  {
+    "timestamp": "2025-12-18T10:30:17.604805+00:00",
+    "model_label": "Seedream 4.5 Edit (Image + Text → Image)",
+    "model": "fal-ai/bytedance/seedream/v4.5/edit",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a86c8c5/WovyCDu3T6NLA0chUwTcl_d0f1b99452404ab096c529bdb59c970a.png"
+    ],
+    "meta": {
+      "prompt": "The woman looking behind her while running , from a dutch camera perspective, while running, blurred background and in distress"
+    }
+  }
+]
