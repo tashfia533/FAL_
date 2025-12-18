@@ -50,5 +50,22 @@
       "image_size": "1024x1024",
       "quality": "high"
     }
+  },
+  {
+    "timestamp": "2025-12-18T12:02:23.374064+00:00",
+    "model_label": "GPT Image 1.5 (FAL) Edit (Image + Text → Image)",
+    "model": "fal-ai/gpt-image-1.5/edit",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a86cae8/OlAweF5HwzeCK4dFBBSaY.png",
+      "https://v3b.fal.media/files/b/0a86cae8/vOTlnyL8N2RHwm4H1IuIa.png",
+      "https://v3b.fal.media/files/b/0a86cae8/NH5Uel58Xw84ggDCeAt1g.png",
+      "https://v3b.fal.media/files/b/0a86cae8/_T39OoXjAVsxuwXpSrdT_.png"
+    ],
+    "meta": {
+      "prompt": "shes smiling and happy, theyre throwing a party and the background is decorated with happy birthday decoration",
+      "image_size": "1536x1024",
+      "quality": "high"
+    }
   }
 ]

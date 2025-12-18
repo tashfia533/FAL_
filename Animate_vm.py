@@ -7,6 +7,9 @@ import time
 import hashlib
 from datetime import datetime, timezone
 import streamlit.components.v1 as components
+from pathlib import Path
+import uuid
+
 
 # -----------------------------
 # CONFIG
@@ -19,13 +22,21 @@ st.caption(
     "and browse generation history."
 )
 
-FAL_API_KEY = st.secrets.get("FAL_KEY")
-if not FAL_API_KEY:
-    st.error("Missing FAL_KEY. Add it in Streamlit Cloud → Settings → Secrets.")
+FAL_API_KEY = st.secrets.get("FAL_KEY") or os.getenv("FAL_KEY")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+if not FAL_API_KEY and not OPENAI_API_KEY:
+    st.error("Missing API keys. Add FAL_KEY and/or OPENAI_API_KEY in Streamlit Secrets (or env vars).")
     st.stop()
+if not FAL_API_KEY:
+    st.warning("FAL_KEY is missing: FAL models will fail until you add it.")
+if not OPENAI_API_KEY:
+    st.info("OPENAI_API_KEY is missing: OpenAI GPT Image 1.5 models will fail until you add it.")
 
 # Use Queue API so models like FLUX/Ideogram work reliably (submit → poll → fetch output)
 FAL_QUEUE_BASE = "https://queue.fal.run"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+
 
 HISTORY_FILE = "history.json"  # JSON "database"
 
@@ -229,6 +240,102 @@ def call_fal_model(model_id: str, payload: dict, timeout_s: int = 900, poll_s: f
 
     raise TimeoutError("Model completed but response was not available in time.")
 
+# -----------------------------
+# OPENAI IMAGE CALLS (gpt-image-1.5)
+# -----------------------------
+def _openai_headers() -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY.")
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+
+def _save_openai_image_bytes(image_bytes: bytes, ext: str = "png") -> str:
+    out_dir = Path.cwd() / "openai_outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ext = (ext or "png").lower()
+    fname = f"openai_{ts}_{uuid.uuid4().hex[:10]}.{ext}"
+    path = out_dir / fname
+    path.write_bytes(image_bytes)
+    return str(path)
+
+
+def openai_images_generate(
+    prompt: str,
+    n: int = 1,
+    size: str = "auto",
+    output_format: str = "png",
+    quality: str = "auto",
+    background: str = "auto",
+    moderation: str = "auto",
+) -> list[str]:
+    url = f"{OPENAI_BASE_URL}/images/generations"
+    payload = {
+        "model": "gpt-image-1.5",
+        "prompt": prompt,
+        "n": int(n),
+        "size": size,
+        "output_format": output_format,
+        "quality": quality,
+        "background": background,
+        "moderation": moderation,
+    }
+    r = requests.post(url, headers={**_openai_headers(), "Content-Type": "application/json"}, json=payload, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI image generation error {r.status_code}: {r.text[:800]}")
+    data = r.json()
+    out = []
+    for item in (data.get("data") or []):
+        b64 = item.get("b64_json")
+        if not b64:
+            continue
+        img_bytes = base64.b64decode(b64)
+        out.append(_save_openai_image_bytes(img_bytes, ext=output_format))
+    return out
+
+
+def openai_images_edit(
+    image_bytes: bytes,
+    prompt: str,
+    n: int = 1,
+    size: str = "auto",
+    output_format: str = "png",
+    quality: str = "auto",
+    background: str = "auto",
+    moderation: str = "auto",
+    mask_bytes: bytes | None = None,
+) -> list[str]:
+    url = f"{OPENAI_BASE_URL}/images/edits"
+
+    files = [("image", ("input.png", image_bytes, "image/png"))]
+    if mask_bytes:
+        files.append(("mask", ("mask.png", mask_bytes, "image/png")))
+
+    data = {
+        "model": "gpt-image-1.5",
+        "prompt": prompt,
+        "n": str(int(n)),
+        "size": size,
+        "output_format": output_format,
+        "quality": quality,
+        "background": background,
+        "moderation": moderation,
+    }
+
+    r = requests.post(url, headers=_openai_headers(), files=files, data=data, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI image edit error {r.status_code}: {r.text[:800]}")
+    payload = r.json()
+    out = []
+    for item in (payload.get("data") or []):
+        b64 = item.get("b64_json")
+        if not b64:
+            continue
+        img_bytes = base64.b64decode(b64)
+        out.append(_save_openai_image_bytes(img_bytes, ext=output_format))
+    return out
+
+
 
 # -----------------------------
 # MODEL OPTIONS
@@ -238,6 +345,13 @@ MODEL_OPTIONS = {
 
     "Nano Banana Pro (Text → Image)": "fal-ai/nano-banana-pro",
     "Nano Banana Pro Edit (Image + Text → Image)": "fal-ai/nano-banana-pro/edit",
+
+    "GPT Image 1.5 (FAL) (Text → Image)": "fal-ai/gpt-image-1.5",
+    "GPT Image 1.5 (FAL) Edit (Image + Text → Image)": "fal-ai/gpt-image-1.5/edit",
+
+    "OpenAI GPT Image 1.5 (Text → Image)": "openai/gpt-image-1.5",
+    "OpenAI GPT Image 1.5 Edit (Image + Text → Image)": "openai/gpt-image-1.5/edit",
+
 
     "Seedream 4.0 (Text → Image)": "fal-ai/bytedance/seedream/v4/text-to-image",
     "Seedream 4.0 Edit (Image + Text → Image)": "fal-ai/bytedance/seedream/v4/edit",
@@ -474,6 +588,86 @@ with left:
     # =====================================================
     # SEEDREAM 4.0 T2I
     # =====================================================
+
+    
+    # =====================================================
+    # GPT IMAGE 1.5 (FAL) (T2I)
+    # =====================================================
+    elif selected_model_id == "fal-ai/gpt-image-1.5":
+        st.markdown("### GPT Image 1.5 (via FAL) – Text → Image")
+
+        gi_prompt = st.text_area("Prompt", key="fal_gi15_prompt")
+        gi_image_size = st.selectbox("Image Size", ["1024x1024", "1536x1024", "1024x1536"], index=0, key="fal_gi15_size")
+        gi_quality = st.selectbox("Quality", ["high", "medium", "low"], index=0, key="fal_gi15_quality")
+        gi_background = st.selectbox("Background", ["auto", "opaque", "transparent"], index=0, key="fal_gi15_bg")
+        gi_output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0, key="fal_gi15_fmt")
+        gi_sync_mode = st.checkbox("Sync Mode (return data URI)", value=False, key="fal_gi15_sync")
+        gi_num_images = st.slider("Num Images", 1, 4, 1, key="fal_gi15_n")
+
+        st.caption("Note: fal currently caps this endpoint at 4 images per request.")
+
+    # =====================================================
+    # GPT IMAGE 1.5 (FAL) EDIT (I+T -> I)
+    # =====================================================
+    elif selected_model_id == "fal-ai/gpt-image-1.5/edit":
+        st.markdown("### GPT Image 1.5 (via FAL) – Image + Text → Image")
+
+        gi_edit_images = st.file_uploader(
+            "Upload Image(s) to Edit (required)",
+            type=["png", "jpg", "jpeg", "webp", "avif"],
+            accept_multiple_files=True,
+            key="fal_gi15_edit_images",
+        )
+        gi_mask = st.file_uploader("Optional Mask (png)", type=["png"], key="fal_gi15_mask")
+
+        gi_edit_prompt = st.text_area("Edit Prompt", key="fal_gi15_edit_prompt")
+        gi_edit_image_size = st.selectbox("Image Size", ["auto", "1024x1024", "1536x1024", "1024x1536"], index=0, key="fal_gi15_edit_size")
+        gi_edit_quality = st.selectbox("Quality", ["high", "medium", "low"], index=0, key="fal_gi15_edit_quality")
+        gi_edit_background = st.selectbox("Background", ["auto", "opaque", "transparent"], index=0, key="fal_gi15_edit_bg")
+        gi_input_fidelity = st.selectbox("Input Fidelity", ["high", "low"], index=0, key="fal_gi15_fid")
+        gi_edit_output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0, key="fal_gi15_edit_fmt")
+        gi_edit_sync_mode = st.checkbox("Sync Mode (return data URI)", value=False, key="fal_gi15_edit_sync")
+        gi_edit_num_images = st.slider("Num Images", 1, 4, 1, key="fal_gi15_edit_n")
+
+        st.caption("Note: fal currently caps this endpoint at 4 images per request.")
+
+
+# =====================================================
+    # OPENAI GPT IMAGE 1.5 (T2I)
+    # =====================================================
+    elif selected_model_id == "openai/gpt-image-1.5":
+        st.markdown("### OpenAI GPT Image 1.5 – Text → Image")
+
+        oai_prompt = st.text_area("Prompt", key="oai_t2i_prompt")
+        oai_size = st.selectbox("Size", ["auto", "1024x1024", "1536x1024", "1024x1536"], index=0)
+        oai_output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0)
+        oai_quality = st.selectbox("Quality", ["auto", "high", "medium", "low"], index=0)
+        oai_background = st.selectbox("Background", ["auto", "opaque", "transparent"], index=0)
+        oai_moderation = st.selectbox("Moderation", ["auto", "low"], index=0)
+        oai_num_images = st.slider("Num Images", 1, 8, 1)
+
+        if oai_background == "transparent" and oai_output_format not in ("png", "webp"):
+            st.info("Transparent background works best with PNG or WEBP outputs.")
+
+    # =====================================================
+    # OPENAI GPT IMAGE 1.5 EDIT (I+T -> I)
+    # =====================================================
+    elif selected_model_id == "openai/gpt-image-1.5/edit":
+        st.markdown("### OpenAI GPT Image 1.5 – Image + Text → Image")
+
+        oai_edit_image = st.file_uploader("Input Image (png/jpg/webp)", type=["png", "jpg", "jpeg", "webp"], key="oai_edit_image")
+        oai_edit_mask = st.file_uploader("Optional Mask (png with transparency)", type=["png"], key="oai_edit_mask")
+
+        oai_edit_prompt = st.text_area("Prompt", key="oai_i2i_prompt")
+        oai_edit_size = st.selectbox("Size", ["auto", "1024x1024", "1536x1024", "1024x1536"], index=0, key="oai_i2i_size")
+        oai_edit_output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0, key="oai_i2i_fmt")
+        oai_edit_quality = st.selectbox("Quality", ["auto", "high", "medium", "low"], index=0, key="oai_i2i_quality")
+        oai_edit_background = st.selectbox("Background", ["auto", "opaque", "transparent"], index=0, key="oai_i2i_bg")
+        oai_edit_moderation = st.selectbox("Moderation", ["auto", "low"], index=0, key="oai_i2i_mod")
+        oai_edit_num_images = st.slider("Num Images", 1, 8, 1, key="oai_i2i_n")
+
+        if oai_edit_background == "transparent" and oai_edit_output_format not in ("png", "webp"):
+            st.info("Transparent background works best with PNG or WEBP outputs.")
     elif selected_model_id == "fal-ai/bytedance/seedream/v4/text-to-image":
         st.markdown("### Seedream 4.0 – Text → Image")
 
@@ -728,7 +922,7 @@ with left:
 # -----------------------------
 if run_btn:
     try:
-        with st.spinner("Calling FAL API…"):
+        with st.spinner("Calling API…"):
 
             # -------- WAN ANIMATE --------
             if selected_model_id == "fal-ai/wan/v2.2-14b/animate/move":
@@ -846,6 +1040,166 @@ if run_btn:
                     kind="image",
                     urls=urls,
                     meta={"prompt": edit_prompt.strip()},
+                )
+
+
+            # -------- GPT IMAGE 1.5 (FAL) T2I --------
+            elif selected_model_id == "fal-ai/gpt-image-1.5":
+                if not FAL_API_KEY:
+                    st.error("FAL_KEY is missing. Add it in Streamlit Secrets or env vars.")
+                    st.stop()
+                if not (gi_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                payload = {
+                    "prompt": gi_prompt.strip(),
+                    "num_images": int(gi_num_images),
+                    "image_size": gi_image_size,
+                    "background": gi_background,
+                    "quality": gi_quality,
+                    "output_format": gi_output_format,
+                    "sync_mode": bool(gi_sync_mode),
+                }
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="image",
+                    urls=urls,
+                    meta={"prompt": gi_prompt.strip(), "image_size": gi_image_size, "quality": gi_quality},
+                )
+
+            # -------- GPT IMAGE 1.5 (FAL) EDIT --------
+            elif selected_model_id == "fal-ai/gpt-image-1.5/edit":
+                if not FAL_API_KEY:
+                    st.error("FAL_KEY is missing. Add it in Streamlit Secrets or env vars.")
+                    st.stop()
+                if not (gi_edit_prompt or "").strip():
+                    st.error("Please enter an edit prompt.")
+                    st.stop()
+                if not gi_edit_images:
+                    st.error("Please upload at least 1 image to edit.")
+                    st.stop()
+
+                payload = {
+                    "prompt": gi_edit_prompt.strip(),
+                    "image_urls": [file_to_data_uri(f) for f in gi_edit_images],
+                    "mask_image_url": file_to_data_uri(gi_mask) if gi_mask else None,
+                    "num_images": int(gi_edit_num_images),
+                    "image_size": gi_edit_image_size,
+                    "background": gi_edit_background,
+                    "quality": gi_edit_quality,
+                    "input_fidelity": gi_input_fidelity,
+                    "output_format": gi_edit_output_format,
+                    "sync_mode": bool(gi_edit_sync_mode),
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="image",
+                    urls=urls,
+                    meta={"prompt": gi_edit_prompt.strip(), "image_size": gi_edit_image_size, "quality": gi_edit_quality},
+                )
+
+            # -------- OPENAI DIRECT GPT IMAGE 1.5 (T2I) --------
+            elif selected_model_id == "openai/gpt-image-1.5":
+                if not OPENAI_API_KEY:
+                    st.error("OPENAI_API_KEY is missing. Add it in Streamlit Secrets or env vars.")
+                    st.stop()
+                if not (oai_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                paths = openai_images_generate(
+                    prompt=oai_prompt.strip(),
+                    n=int(oai_num_images),
+                    size=oai_size,
+                    output_format=oai_output_format,
+                    quality=oai_quality,
+                    background=oai_background,
+                    moderation=oai_moderation,
+                )
+                if not paths:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(paths), 2))
+                for i, p in enumerate(paths):
+                    cols[i % len(cols)].image(p, use_column_width=True)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="image",
+                    urls=paths,
+                    meta={"prompt": oai_prompt.strip(), "size": oai_size, "quality": oai_quality},
+                )
+
+            # -------- OPENAI DIRECT GPT IMAGE 1.5 (EDIT) --------
+            elif selected_model_id == "openai/gpt-image-1.5/edit":
+                if not OPENAI_API_KEY:
+                    st.error("OPENAI_API_KEY is missing. Add it in Streamlit Secrets or env vars.")
+                    st.stop()
+                if not oai_edit_image:
+                    st.error("Please upload an input image.")
+                    st.stop()
+                if not (oai_edit_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                image_bytes = oai_edit_image.read()
+                mask_bytes = oai_edit_mask.read() if oai_edit_mask else None
+
+                paths = openai_images_edit(
+                    image_bytes=image_bytes,
+                    prompt=oai_edit_prompt.strip(),
+                    n=int(oai_edit_num_images),
+                    size=oai_edit_size,
+                    output_format=oai_edit_output_format,
+                    quality=oai_edit_quality,
+                    background=oai_edit_background,
+                    moderation=oai_edit_moderation,
+                    mask_bytes=mask_bytes,
+                )
+                if not paths:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(paths), 2))
+                for i, p in enumerate(paths):
+                    cols[i % len(cols)].image(p, use_column_width=True)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="image",
+                    urls=paths,
+                    meta={"prompt": oai_edit_prompt.strip(), "size": oai_edit_size, "quality": oai_edit_quality},
                 )
 
             # -------- SEEDREAM 4.0 T2I --------
