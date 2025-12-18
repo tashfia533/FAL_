@@ -1,0 +1,1150 @@
+import streamlit as st
+import requests
+import base64
+import os
+import json
+import time
+import hashlib
+from datetime import datetime, timezone
+import streamlit.components.v1 as components
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+st.set_page_config(page_title="Multi-Model Media Platform", layout="wide")
+
+st.title("Multi-Model Media Platform")
+st.caption(
+    "Switch between different models in one UI, configure settings, call the FAL API, "
+    "and browse generation history."
+)
+
+FAL_API_KEY = st.secrets.get("FAL_KEY")
+if not FAL_API_KEY:
+    st.error("Missing FAL_KEY. Add it in Streamlit Cloud → Settings → Secrets.")
+    st.stop()
+
+# Use Queue API so models like FLUX/Ideogram work reliably (submit → poll → fetch output)
+FAL_QUEUE_BASE = "https://queue.fal.run"
+
+HISTORY_FILE = "history.json"  # JSON "database"
+
+# -----------------------------
+# SMALL UI CSS (tiles)
+# -----------------------------
+st.markdown(
+    """
+    <style>
+      /* Make sidebar buttons look like tabs */
+      div[data-testid="column"] button[kind="secondary"] {
+        width: 100%;
+      }
+
+      /* Tile container */
+      .tile {
+        border: 1px solid rgba(49, 51, 63, 0.2);
+        border-radius: 12px;
+        padding: 10px;
+        margin-bottom: 12px;
+        background: rgba(255,255,255,0.02);
+      }
+
+      .tile-title {
+        font-size: 12px;
+        opacity: 0.85;
+        margin-top: 6px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* Make Streamlit videos less tall in columns */
+      div[data-testid="stVideo"] video {
+        max-height: 160px !important;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -----------------------------
+# SESSION STATE (page + zoom)
+# -----------------------------
+if "page" not in st.session_state:
+    st.session_state.page = "Generator"
+
+if "zoom_url" not in st.session_state:
+    st.session_state.zoom_url = None
+if "zoom_kind" not in st.session_state:
+    st.session_state.zoom_kind = None
+if "zoom_meta" not in st.session_state:
+    st.session_state.zoom_meta = None
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def _hash(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8")).hexdigest()[:10]
+
+
+def file_to_data_uri(uploaded_file) -> str | None:
+    """Convert Streamlit UploadedFile to base64 data URI (works as url for FAL)."""
+    if uploaded_file is None:
+        return None
+    file_bytes = uploaded_file.read()
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    mime = uploaded_file.type or "application/octet-stream"
+    return f"data:{mime};base64,{b64}"
+
+
+# -----------------------------
+# HISTORY HELPERS
+# -----------------------------
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.warning(f"Could not save history: {e}")
+
+
+def add_history_item(model_label, model_id, kind, urls, meta=None):
+    """Store history. UI will NOT show time/type, but we keep timestamp for sorting."""
+    if not urls:
+        return
+    history = load_history()
+    history.append(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model_label": model_label,
+            "model": model_id,
+            "kind": kind,  # image | video
+            "urls": urls,
+            "meta": meta or {},
+        }
+    )
+    # Optional: keep file from growing forever
+    history = history[-400:]  # last 400 entries
+    save_history(history)
+
+
+# -----------------------------
+# FAL QUEUE CALL (submit -> poll -> fetch output)
+# -----------------------------
+def call_fal_model(model_id: str, payload: dict, timeout_s: int = 900, poll_s: float = 2.0) -> dict:
+    """
+    Queue flow:
+      POST  https://queue.fal.run/<model_id> -> QueueStatus with request_id + urls
+      GET   status_url until COMPLETED
+      GET   response_url to fetch final output
+    """
+    submit_url = f"{FAL_QUEUE_BASE}/{model_id}"
+
+    headers = {
+        "Authorization": f"Key {FAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(submit_url, json=payload, headers=headers, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"FAL submit error {r.status_code}: {r.text[:500]}")
+
+    status = r.json()
+    request_id = status.get("request_id")
+    status_url = status.get("status_url")
+    response_url = status.get("response_url")
+
+    if not request_id or not response_url:
+        # Some endpoints might directly return output (rare); fallback
+        if isinstance(status, dict) and ("images" in status or "video" in status):
+            return status
+        raise RuntimeError(f"Unexpected queue response: {str(status)[:500]}")
+
+    start = time.time()
+    while True:
+        if time.time() - start > timeout_s:
+            raise TimeoutError("Timed out waiting for the model to finish.")
+
+        sr = requests.get(status_url, headers=headers, timeout=60)
+        if sr.status_code != 200:
+            raise RuntimeError(f"FAL status error {sr.status_code}: {sr.text[:500]}")
+
+        sjson = sr.json()
+        st_status = sjson.get("status")
+
+        if st_status == "COMPLETED":
+            break
+
+        # Optional: show logs if present
+        # logs = sjson.get("logs")
+        time.sleep(poll_s)
+
+    rr = requests.get(response_url, headers=headers, timeout=120)
+    if rr.status_code != 200:
+        raise RuntimeError(f"FAL response error {rr.status_code}: {rr.text[:500]}")
+    return rr.json()
+
+
+# -----------------------------
+# MODEL OPTIONS
+# -----------------------------
+MODEL_OPTIONS = {
+    "WAN Animate (Video + Image → Video)": "fal-ai/wan/v2.2-14b/animate/move",
+
+    "Nano Banana Pro (Text → Image)": "fal-ai/nano-banana-pro",
+    "Nano Banana Pro Edit (Image + Text → Image)": "fal-ai/nano-banana-pro/edit",
+
+    "Seedream 4.0 (Text → Image)": "fal-ai/bytedance/seedream/v4/text-to-image",
+    "Seedream 4.0 Edit (Image + Text → Image)": "fal-ai/bytedance/seedream/v4/edit",
+
+    "Seedream 4.5 (Text → Image)": "fal-ai/bytedance/seedream/v4.5/text-to-image",
+    "Seedream 4.5 Edit (Image + Text → Image)": "fal-ai/bytedance/seedream/v4.5/edit",
+
+    "FLUX Kontext Max Multi (Multi-Image Edit)": "fal-ai/flux-pro/kontext/max/multi",
+    "FLUX.2 Pro (Text → Image)": "fal-ai/flux-2-pro",
+    "FLUX.2 Pro Edit (Image → Image)": "fal-ai/flux-2-pro/edit",
+
+    "Ideogram v3 Reframe": "fal-ai/ideogram/v3/reframe",
+}
+
+# -----------------------------
+# SIDEBAR "TABS" (side-by-side)
+# -----------------------------
+with st.sidebar:
+    st.markdown("### Navigation")
+    c1, c2 = st.columns(2)
+
+    if c1.button("Generator", type="secondary", use_container_width=True):
+        st.session_state.page = "Generator"
+        st.session_state.zoom_url = None
+        st.session_state.zoom_kind = None
+        st.session_state.zoom_meta = None
+        st.rerun()
+
+    if c2.button("History", type="secondary", use_container_width=True):
+        st.session_state.page = "History"
+        st.session_state.zoom_url = None
+        st.session_state.zoom_kind = None
+        st.session_state.zoom_meta = None
+        st.rerun()
+
+# =========================================================
+# HISTORY PAGE
+# =========================================================
+if st.session_state.page == "History":
+    st.header("History")
+
+    history = load_history()
+    if not history:
+        st.info("No history saved yet. Generate something first.")
+        st.stop()
+
+    # Newest first
+    history_sorted = sorted(history, key=lambda x: x.get("timestamp", ""), reverse=True)
+
+    # Group by model_label
+    grouped = {}
+    for entry in history_sorted:
+        label = entry.get("model_label") or entry.get("model") or "Unknown"
+        grouped.setdefault(label, []).append(entry)
+
+    # Zoom viewer (top)
+    if st.session_state.zoom_url:
+        st.markdown("### Preview")
+        if st.session_state.zoom_kind == "image":
+            st.image(st.session_state.zoom_url, use_column_width=True)
+        else:
+            st.video(st.session_state.zoom_url)
+
+        with st.expander("Details", expanded=False):
+            st.json(st.session_state.zoom_meta or {})
+
+        if st.button("Close preview"):
+            st.session_state.zoom_url = None
+            st.session_state.zoom_kind = None
+            st.session_state.zoom_meta = None
+            st.rerun()
+
+        st.markdown("---")
+
+    # Render per-model sections
+    for model_label, entries in grouped.items():
+        st.subheader(model_label)
+
+        # Flatten urls into media tiles (so multi-image outputs become multiple tiles)
+        tiles = []
+        for e in entries:
+            kind = e.get("kind", "image")
+            meta = e.get("meta", {})
+            for u in e.get("urls", []):
+                tiles.append({"kind": kind, "url": u, "meta": meta, "model": e.get("model")})
+
+        if not tiles:
+            st.caption("No items.")
+            continue
+
+        # Separate image tiles and video tiles so layout looks clean
+        image_tiles = [t for t in tiles if t["kind"] == "image"]
+        video_tiles = [t for t in tiles if t["kind"] == "video"]
+
+        # ---- Images grid ----
+        if image_tiles:
+            cols = st.columns(4)
+            for i, t in enumerate(image_tiles):
+                with cols[i % 4]:
+                    st.markdown('<div class="tile">', unsafe_allow_html=True)
+                    st.image(t["url"], width=180)
+                    st.markdown(
+                        f'<div class="tile-title">Image</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Open", key=f"open_img_{model_label}_{i}_{_hash(t['url'])}"):
+                        st.session_state.zoom_url = t["url"]
+                        st.session_state.zoom_kind = "image"
+                        st.session_state.zoom_meta = t["meta"]
+                        st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+        # ---- Videos grid ----
+        if video_tiles:
+            cols = st.columns(3)
+            for i, t in enumerate(video_tiles):
+                with cols[i % 3]:
+                    st.markdown('<div class="tile">', unsafe_allow_html=True)
+
+                    # Smaller video using HTML so it behaves like a "tile"
+                    components.html(
+                        f"""
+                        <video src="{t['url']}" controls preload="metadata"
+                               style="width:100%; max-height:160px; border-radius:10px;"></video>
+                        """,
+                        height=190,
+                    )
+
+                    st.markdown(
+                        f'<div class="tile-title">Video</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Open", key=f"open_vid_{model_label}_{i}_{_hash(t['url'])}"):
+                        st.session_state.zoom_url = t["url"]
+                        st.session_state.zoom_kind = "video"
+                        st.session_state.zoom_meta = t["meta"]
+                        st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+    st.stop()
+
+# =========================================================
+# GENERATOR PAGE
+# =========================================================
+st.header("Generator")
+
+selected_model_label = st.selectbox("Choose model", list(MODEL_OPTIONS.keys()))
+selected_model_id = MODEL_OPTIONS[selected_model_label]
+
+st.write("---")
+
+left, right = st.columns([1, 1])
+
+with right:
+    st.subheader("Result")
+    output_area = st.empty()
+    extra_info = st.empty()
+
+with left:
+    st.subheader("Inputs & Settings")
+
+    run_btn = st.button("🚀 Run", type="primary", use_container_width=True)
+    reset_btn = st.button("🔄 Reset", use_container_width=True)
+    if reset_btn:
+        st.rerun()
+
+    st.markdown("---")
+
+    # =====================================================
+    # WAN ANIMATE
+    # =====================================================
+    if selected_model_id == "fal-ai/wan/v2.2-14b/animate/move":
+        st.markdown("### WAN Animate – Video + Image → Video")
+
+        video_file = st.file_uploader("Upload Source Video", type=["mp4", "mov", "webm", "m4v", "gif"])
+        image_file = st.file_uploader("Upload Reference Image", type=["png", "jpg", "jpeg", "webp", "gif", "avif"])
+
+        use_turbo = st.checkbox("Use Turbo", value=True)
+        guidance_scale = st.slider("Guidance Scale", 0.0, 20.0, 1.0, 0.1)
+        resolution = st.selectbox("Resolution", ["480p", "580p", "720p"], index=0)
+
+        seed = st.number_input("Seed", min_value=0, max_value=2_147_483_647, value=1234)
+        steps = st.number_input("Inference Steps", min_value=1, max_value=250, value=20)
+
+        enable_safety = st.checkbox("Enable Safety Checker", value=True)
+        enable_output_safety = st.checkbox("Enable Output Safety Checker", value=True)
+
+        shift = st.slider("Shift", 1.0, 10.0, 5.0, 0.1)
+        video_quality = st.selectbox("Video Quality", ["low", "medium", "high", "maximum"], index=2)
+        video_mode = st.selectbox("Video Write Mode", ["fast", "balanced", "small"], index=1)
+        return_zip = st.checkbox("Also return frames ZIP", value=False)
+
+    # =====================================================
+    # NANO BANANA PRO (T2I)
+    # =====================================================
+    elif selected_model_id == "fal-ai/nano-banana-pro":
+        st.markdown("### Nano Banana Pro – Text → Image")
+
+        prompt = st.text_area("Prompt")
+        aspect_ratio = st.selectbox(
+            "Aspect Ratio",
+            ["21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"],
+            index=5,
+        )
+        resolution = st.selectbox("Resolution", ["1K", "2K", "4K"], index=0)
+        num_images = st.slider("Num Images", 1, 4, 1)
+        output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0)
+        enable_web_search = st.checkbox("Enable Web Search", value=False)
+
+    # =====================================================
+    # NANO BANANA PRO EDIT (I2I)
+    # =====================================================
+    elif selected_model_id == "fal-ai/nano-banana-pro/edit":
+        st.markdown("### Nano Banana Pro Edit – Image + Text → Image")
+
+        edit_prompt = st.text_area("Edit Prompt")
+        edit_images = st.file_uploader(
+            "Upload Image(s) to Edit",
+            type=["png", "jpg", "jpeg", "webp", "avif"],
+            accept_multiple_files=True,
+        )
+
+        aspect_ratio = st.selectbox(
+            "Aspect Ratio",
+            ["auto", "21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"],
+            index=0,
+        )
+        resolution = st.selectbox("Resolution", ["1K", "2K", "4K"], index=0)
+        num_images = st.slider("Num Images", 1, 4, 1)
+        output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0)
+
+    # =====================================================
+    # SEEDREAM 4.0 T2I
+    # =====================================================
+    elif selected_model_id == "fal-ai/bytedance/seedream/v4/text-to-image":
+        st.markdown("### Seedream 4.0 – Text → Image")
+
+        sd_prompt = st.text_area("Prompt")
+        sd_width = st.number_input("Width (px)", min_value=512, max_value=4096, value=1280, step=64)
+        sd_height = st.number_input("Height (px)", min_value=512, max_value=4096, value=1280, step=64)
+
+        sd_num_images = st.slider("Num Images", 1, 4, 1)
+        sd_max_images = st.number_input("Max Images", min_value=1, max_value=8, value=4)
+
+        sd_seed = st.number_input("Seed (0 = random)", min_value=0, max_value=2_147_483_647, value=0)
+        sd_sync_mode = st.checkbox("Sync Mode", value=False)
+        sd_enable_safety = st.checkbox("Enable Safety Checker", value=True)
+        sd_enhance_mode = st.selectbox("Enhance Prompt Mode", ["standard"], index=0)
+        sd_output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0)
+
+    # =====================================================
+    # SEEDREAM 4.0 EDIT
+    # =====================================================
+    elif selected_model_id == "fal-ai/bytedance/seedream/v4/edit":
+        st.markdown("### Seedream 4.0 Edit – Image + Text → Image")
+
+        sd_edit_prompt = st.text_area("Edit Prompt")
+        sd_edit_images = st.file_uploader(
+            "Upload Image(s) to Edit", type=["png", "jpg", "jpeg", "webp", "avif"], accept_multiple_files=True
+        )
+
+        sd_width = st.number_input("Width (px)", min_value=512, max_value=4096, value=1280, step=64)
+        sd_height = st.number_input("Height (px)", min_value=512, max_value=4096, value=1280, step=64)
+
+        sd_num_images = st.slider("Num Images", 1, 4, 1)
+        sd_max_images = st.number_input("Max Images", min_value=1, max_value=8, value=4)
+
+        sd_seed = st.number_input("Seed (0 = random)", min_value=0, max_value=2_147_483_647, value=0)
+        sd_sync_mode = st.checkbox("Sync Mode", value=False)
+        sd_enable_safety = st.checkbox("Enable Safety Checker", value=True)
+        sd_enhance_mode = st.selectbox("Enhance Prompt Mode", ["standard"], index=0)
+        sd_output_format = st.selectbox("Output Format", ["png", "jpeg", "webp"], index=0)
+
+    # =====================================================
+    # SEEDREAM 4.5 T2I
+    # =====================================================
+    elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/text-to-image":
+        st.markdown("### Seedream 4.5 – Text → Image")
+
+        sd45_prompt = st.text_area("Prompt")
+        sd45_image_size = st.selectbox(
+            "Image Size",
+            ["square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9", "auto_2K", "auto_4K"],
+            index=6,
+        )
+
+        sd45_num_images = st.slider("Num Images", 1, 6, 1)
+        sd45_max_images = st.number_input("Max Images", min_value=1, max_value=10, value=1)
+
+        sd45_seed = st.number_input("Seed (0 = random)", min_value=0, max_value=2_147_483_647, value=0)
+        sd45_sync_mode = st.checkbox("Sync Mode", value=False)
+        sd45_enable_safety = st.checkbox("Enable Safety Checker", value=True)
+
+    # =====================================================
+    # SEEDREAM 4.5 EDIT
+    # =====================================================
+    elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/edit":
+        st.markdown("### Seedream 4.5 Edit – Image + Text → Image")
+
+        sd45_edit_prompt = st.text_area("Edit Prompt")
+        sd45_edit_images = st.file_uploader(
+            "Upload Image(s) to Edit", type=["png", "jpg", "jpeg", "webp", "avif"], accept_multiple_files=True
+        )
+
+        sd45_image_size = st.selectbox(
+            "Image Size",
+            ["square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9", "auto_2K", "auto_4K"],
+            index=7,
+        )
+
+        sd45_num_images = st.slider("Num Images", 1, 6, 1)
+        sd45_max_images = st.number_input("Max Images", min_value=1, max_value=10, value=1)
+
+        sd45_seed = st.number_input("Seed (0 = random)", min_value=0, max_value=2_147_483_647, value=0)
+        sd45_sync_mode = st.checkbox("Sync Mode", value=False)
+        sd45_enable_safety = st.checkbox("Enable Safety Checker", value=True)
+
+    # =====================================================
+    # FLUX PRO KONTEXT MAX MULTI
+    # Schema (key fields): prompt (required), image_urls (required), guidance_scale, seed, sync_mode, num_images, output_format, safety_tolerance, enhance_prompt, aspect_ratio
+    # =====================================================
+    elif selected_model_id == "fal-ai/flux-pro/kontext/max/multi":
+        st.markdown("### FLUX Kontext Max Multi – Multi-image edit")
+
+        flux_prompt = st.text_area("Prompt", placeholder="Put the little duckling on top of the woman's t-shirt.")
+
+        flux_images_up = st.file_uploader(
+            "Upload Image(s) (required)",
+            type=["png", "jpg", "jpeg", "webp", "avif"],
+            accept_multiple_files=True,
+            help="Upload 1+ images (the model requires image_urls).",
+        )
+
+        flux_image_urls_text = st.text_area(
+            "Or paste image URL(s) (one per line)",
+            help="Optional. If you upload images above, you can leave this empty.",
+        )
+
+        flux_guidance = st.slider("Guidance scale (CFG)", 1.0, 20.0, 3.5, 0.1)
+        flux_seed = st.number_input("Seed (0 = random)", 0, 2_147_483_647, 0)
+        flux_sync = st.checkbox("Sync Mode", value=False)
+        flux_num = st.slider("Num Images", 1, 4, 1)
+        flux_format = st.selectbox("Output Format", ["jpeg", "png"], index=0)
+        flux_safety = st.selectbox("Safety Tolerance", ["1", "2", "3", "4", "5", "6"], index=1)
+        flux_enhance = st.checkbox("Enhance Prompt", value=False)
+        flux_aspect = st.selectbox(
+            "Aspect Ratio (optional)",
+            ["(none)", "21:9", "16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16", "9:21"],
+            index=0,
+        )
+
+    # =====================================================
+    # FLUX.2 PRO (TEXT TO IMAGE)
+    # Schema: prompt(required), image_size (preset or {w,h}), seed, safety_tolerance, enable_safety_checker, output_format, sync_mode
+    # =====================================================
+    elif selected_model_id == "fal-ai/flux-2-pro":
+        st.markdown("### FLUX.2 Pro – Text → Image")
+
+        f2_prompt = st.text_area("Prompt")
+
+        f2_size_mode = st.selectbox("Image Size Mode", ["Preset", "Custom"], index=0)
+        if f2_size_mode == "Preset":
+            f2_image_size = st.selectbox(
+                "Preset",
+                ["square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9"],
+                index=4,  # landscape_4_3 default
+            )
+            f2_custom_w = None
+            f2_custom_h = None
+        else:
+            f2_custom_w = st.number_input("Width", min_value=64, max_value=14142, value=1024, step=64)
+            f2_custom_h = st.number_input("Height", min_value=64, max_value=14142, value=768, step=64)
+            f2_image_size = None
+
+        f2_seed = st.number_input("Seed (0 = random)", 0, 2_147_483_647, 0)
+        f2_safety = st.selectbox("Safety Tolerance", ["1", "2", "3", "4", "5"], index=1)
+        f2_enable_checker = st.checkbox("Enable Safety Checker", value=True)
+        f2_format = st.selectbox("Output Format", ["jpeg", "png"], index=0)
+        f2_sync = st.checkbox("Sync Mode", value=False)
+
+    # =====================================================
+    # FLUX.2 PRO EDIT
+    # (based on playground): prompt(required), image_urls(required), image_size(auto or preset or custom), seed, safety_tolerance, enable_safety_checker, output_format, sync_mode
+    # =====================================================
+    elif selected_model_id == "fal-ai/flux-2-pro/edit":
+        st.markdown("### FLUX.2 Pro Edit – Image + Text → Image")
+
+        f2e_prompt = st.text_area("Prompt (edit instruction)")
+
+        f2e_images = st.file_uploader(
+            "Upload Image(s) (required)",
+            type=["png", "jpg", "jpeg", "webp", "avif"],
+            accept_multiple_files=True,
+        )
+
+        f2e_size_mode = st.selectbox("Image Size Mode", ["Auto", "Preset", "Custom"], index=0)
+        if f2e_size_mode == "Auto":
+            f2e_image_size = "auto"
+            f2e_w = None
+            f2e_h = None
+        elif f2e_size_mode == "Preset":
+            f2e_image_size = st.selectbox(
+                "Preset",
+                ["square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9"],
+                index=0,
+            )
+            f2e_w = None
+            f2e_h = None
+        else:
+            f2e_w = st.number_input("Width", min_value=64, max_value=14142, value=1024, step=64)
+            f2e_h = st.number_input("Height", min_value=64, max_value=14142, value=1024, step=64)
+            f2e_image_size = None
+
+        f2e_seed = st.number_input("Seed (0 = random)", 0, 2_147_483_647, 0)
+        f2e_safety = st.selectbox("Safety Tolerance", ["1", "2", "3", "4", "5"], index=1)
+        f2e_enable_checker = st.checkbox("Enable Safety Checker", value=True)
+        f2e_format = st.selectbox("Output Format", ["jpeg", "png"], index=0)
+        f2e_sync = st.checkbox("Sync Mode", value=False)
+
+    # =====================================================
+    # IDEOGRAM V3 REFRAME
+    # Schema (key fields): image_url(required), image_size(required), rendering_speed, color_palette, style, style_codes, style_preset,
+    #                      image_urls(style reference), num_images, seed, sync_mode
+    # =====================================================
+    elif selected_model_id == "fal-ai/ideogram/v3/reframe":
+        st.markdown("### Ideogram v3 Reframe")
+
+        # Required: image_url
+        ideo_source_mode = st.selectbox("Source Image Input", ["Upload", "URL"], index=0)
+        if ideo_source_mode == "Upload":
+            ideo_upload = st.file_uploader("Upload Image (required)", type=["jpg", "jpeg", "png", "webp", "gif", "avif"])
+            ideo_image_url = None
+            ideo_image_url_text = None
+        else:
+            ideo_upload = None
+            ideo_image_url_text = st.text_input("Image URL (required)")
+            ideo_image_url = None
+
+        ideo_image_size_mode = st.selectbox("Image Size", ["square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9"], index=0)
+
+        ideo_render_speed = st.selectbox("Rendering Speed", ["BALANCED", "QUALITY", "TURBO"], index=0)
+        ideo_num_images = st.slider("Num Images", 1, 8, 1)
+        ideo_seed = st.number_input("Seed (0 = random)", 0, 2_147_483_647, 0)
+        ideo_sync = st.checkbox("Sync Mode", value=False)
+
+        st.markdown("#### Style (optional)")
+        ideo_style_codes = st.text_input("Style Codes (comma-separated)", help="If set, you cannot use Style or Style Reference Images.")
+        ideo_style = st.selectbox("Style", ["(none)", "AUTO", "GENERAL", "REALISTIC", "DESIGN"], index=0)
+
+        # Huge list exists; keep it optional and freeform-friendly:
+        ideo_style_preset = st.text_input("Style Preset (optional)", placeholder="e.g. PHOTO / CINEMATIC / ... (paste preset name)")
+
+        st.markdown("#### Style Reference Images (optional)")
+        ideo_ref_images = st.file_uploader(
+            "Upload reference image(s)",
+            type=["jpg", "jpeg", "png", "webp", "gif", "avif"],
+            accept_multiple_files=True,
+            help="Used for style reference. Not allowed when Style Codes are provided.",
+        )
+
+        st.markdown("#### Color Palette (optional)")
+        palette_mode = st.selectbox("Color Palette Mode", ["None", "Preset name", "Custom RGB"], index=0)
+        if palette_mode == "None":
+            ideo_palette = None
+        elif palette_mode == "Preset name":
+            palette_name = st.text_input("Palette Name", placeholder="e.g. 'ARCADIA' or another Ideogram palette name")
+            palette_weight = st.slider("Color Weight", 0.0, 1.0, 0.5, 0.05)
+            ideo_palette = {"name": palette_name.strip() if palette_name else "", "members": [], "color_weight": palette_weight}
+        else:
+            # Custom palette with up to 5 colors via hex
+            palette_weight = st.slider("Color Weight", 0.0, 1.0, 0.5, 0.05)
+            ncols = st.slider("How many colors?", 1, 5, 2)
+            members = []
+            for i in range(ncols):
+                hx = st.text_input(f"Color {i+1} hex", value="#FF0000" if i == 0 else "#00FF00")
+                hx = hx.strip().lstrip("#")
+                if len(hx) == 6:
+                    r = int(hx[0:2], 16)
+                    g = int(hx[2:4], 16)
+                    b = int(hx[4:6], 16)
+                    members.append({"rgb": {"r": r, "g": g, "b": b}})
+            ideo_palette = {"name": "", "members": members, "color_weight": palette_weight}
+
+# -----------------------------
+# RUN LOGIC
+# -----------------------------
+if run_btn:
+    try:
+        with st.spinner("Calling FAL API…"):
+
+            # -------- WAN ANIMATE --------
+            if selected_model_id == "fal-ai/wan/v2.2-14b/animate/move":
+                if not video_file or not image_file:
+                    st.error("Please upload both a video and an image.")
+                    st.stop()
+
+                payload = {
+                    "video_url": file_to_data_uri(video_file),
+                    "image_url": file_to_data_uri(image_file),
+                    "guidance_scale": float(guidance_scale),
+                    "resolution": resolution,
+                    "seed": int(seed),
+                    "num_inference_steps": int(steps),
+                    "enable_safety_checker": bool(enable_safety),
+                    "enable_output_safety_checker": bool(enable_output_safety),
+                    "shift": float(shift),
+                    "video_quality": video_quality,
+                    "video_write_mode": video_mode,
+                    "return_frames_zip": bool(return_zip),
+                    "use_turbo": bool(use_turbo),
+                }
+
+                result = call_fal_model(selected_model_id, payload)
+
+                video_data = result.get("video") or {}
+                video_url = video_data.get("url")
+
+                if not video_url:
+                    st.error("No video URL returned.")
+                    st.stop()
+
+                output_area.video(video_url)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="video",
+                    urls=[video_url],
+                    meta={"seed": result.get("seed")},
+                )
+
+            # -------- NANO BANANA PRO --------
+            elif selected_model_id == "fal-ai/nano-banana-pro":
+                if not (prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                payload = {
+                    "prompt": prompt.strip(),
+                    "num_images": int(num_images),
+                    "aspect_ratio": aspect_ratio,
+                    "resolution": resolution,
+                    "output_format": output_format,
+                    "enable_web_search": bool(enable_web_search),
+                }
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                if not images:
+                    st.error("No images returned.")
+                    st.stop()
+
+                urls = []
+                cols = st.columns(min(len(images), 2))
+                for i, img in enumerate(images):
+                    url = img.get("url")
+                    if not url:
+                        continue
+                    urls.append(url)
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="image",
+                    urls=urls,
+                    meta={"prompt": prompt.strip()},
+                )
+
+            # -------- NANO BANANA PRO EDIT --------
+            elif selected_model_id == "fal-ai/nano-banana-pro/edit":
+                if not (edit_prompt or "").strip():
+                    st.error("Please enter an edit prompt.")
+                    st.stop()
+                if not edit_images:
+                    st.error("Please upload at least one image to edit.")
+                    st.stop()
+
+                image_urls = [file_to_data_uri(f) for f in edit_images]
+                payload = {
+                    "prompt": edit_prompt.strip(),
+                    "image_urls": image_urls,
+                    "num_images": int(num_images),
+                    "aspect_ratio": None if aspect_ratio == "auto" else aspect_ratio,
+                    "resolution": resolution,
+                    "output_format": output_format,
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                if not images:
+                    st.error("No images returned.")
+                    st.stop()
+
+                urls = [img.get("url") for img in images if img.get("url")]
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(
+                    model_label=selected_model_label,
+                    model_id=selected_model_id,
+                    kind="image",
+                    urls=urls,
+                    meta={"prompt": edit_prompt.strip()},
+                )
+
+            # -------- SEEDREAM 4.0 T2I --------
+            elif selected_model_id == "fal-ai/bytedance/seedream/v4/text-to-image":
+                if not (sd_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                payload = {
+                    "prompt": sd_prompt.strip(),
+                    "image_size": {"width": int(sd_width), "height": int(sd_height)},
+                    "num_images": int(sd_num_images),
+                    "max_images": int(sd_max_images),
+                    "seed": None if int(sd_seed) == 0 else int(sd_seed),
+                    "sync_mode": bool(sd_sync_mode),
+                    "enable_safety_checker": bool(sd_enable_safety),
+                    "enhance_prompt_mode": sd_enhance_mode,
+                    "output_format": sd_output_format,
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd_prompt.strip()})
+
+            # -------- SEEDREAM 4.0 EDIT --------
+            elif selected_model_id == "fal-ai/bytedance/seedream/v4/edit":
+                if not (sd_edit_prompt or "").strip():
+                    st.error("Please enter an edit prompt.")
+                    st.stop()
+                if not sd_edit_images:
+                    st.error("Please upload at least one image.")
+                    st.stop()
+
+                payload = {
+                    "prompt": sd_edit_prompt.strip(),
+                    "image_urls": [file_to_data_uri(f) for f in sd_edit_images],
+                    "image_size": {"width": int(sd_width), "height": int(sd_height)},
+                    "num_images": int(sd_num_images),
+                    "max_images": int(sd_max_images),
+                    "seed": None if int(sd_seed) == 0 else int(sd_seed),
+                    "sync_mode": bool(sd_sync_mode),
+                    "enable_safety_checker": bool(sd_enable_safety),
+                    "enhance_prompt_mode": sd_enhance_mode,
+                    "output_format": sd_output_format,
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd_edit_prompt.strip()})
+
+            # -------- SEEDREAM 4.5 T2I --------
+            elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/text-to-image":
+                if not (sd45_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                payload = {
+                    "prompt": sd45_prompt.strip(),
+                    "image_size": sd45_image_size,
+                    "num_images": int(sd45_num_images),
+                    "max_images": int(sd45_max_images),
+                    "seed": None if int(sd45_seed) == 0 else int(sd45_seed),
+                    "sync_mode": bool(sd45_sync_mode),
+                    "enable_safety_checker": bool(sd45_enable_safety),
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd45_prompt.strip()})
+
+            # -------- SEEDREAM 4.5 EDIT --------
+            elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/edit":
+                if not (sd45_edit_prompt or "").strip():
+                    st.error("Please enter an edit prompt.")
+                    st.stop()
+                if not sd45_edit_images:
+                    st.error("Please upload at least one image.")
+                    st.stop()
+
+                payload = {
+                    "prompt": sd45_edit_prompt.strip(),
+                    "image_urls": [file_to_data_uri(f) for f in sd45_edit_images],
+                    "image_size": sd45_image_size,
+                    "num_images": int(sd45_num_images),
+                    "max_images": int(sd45_max_images),
+                    "seed": None if int(sd45_seed) == 0 else int(sd45_seed),
+                    "sync_mode": bool(sd45_sync_mode),
+                    "enable_safety_checker": bool(sd45_enable_safety),
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd45_edit_prompt.strip()})
+
+            # -------- FLUX PRO KONTEXT MAX MULTI --------
+            elif selected_model_id == "fal-ai/flux-pro/kontext/max/multi":
+                if not (flux_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                # Combine uploaded images + pasted URLs
+                all_imgs = []
+                if flux_images_up:
+                    all_imgs.extend([file_to_data_uri(f) for f in flux_images_up])
+
+                if (flux_image_urls_text or "").strip():
+                    for line in flux_image_urls_text.splitlines():
+                        line = line.strip()
+                        if line:
+                            all_imgs.append(line)
+
+                if not all_imgs:
+                    st.error("This model requires image_urls. Upload or paste at least 1 image.")
+                    st.stop()
+
+                payload = {
+                    "prompt": flux_prompt.strip(),
+                    "image_urls": all_imgs,
+                    "guidance_scale": float(flux_guidance),
+                    "sync_mode": bool(flux_sync),
+                    "num_images": int(flux_num),
+                    "output_format": flux_format,
+                    "safety_tolerance": flux_safety,
+                    "enhance_prompt": bool(flux_enhance),
+                }
+                if int(flux_seed) != 0:
+                    payload["seed"] = int(flux_seed)
+                if flux_aspect != "(none)":
+                    payload["aspect_ratio"] = flux_aspect
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": flux_prompt.strip()})
+
+            # -------- FLUX.2 PRO T2I --------
+            elif selected_model_id == "fal-ai/flux-2-pro":
+                if not (f2_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+
+                payload = {
+                    "prompt": f2_prompt.strip(),
+                    "output_format": f2_format,
+                    "sync_mode": bool(f2_sync),
+                    "safety_tolerance": f2_safety,
+                    "enable_safety_checker": bool(f2_enable_checker),
+                }
+                if f2_size_mode == "Preset":
+                    payload["image_size"] = f2_image_size
+                else:
+                    payload["image_size"] = {"width": int(f2_custom_w), "height": int(f2_custom_h)}
+
+                if int(f2_seed) != 0:
+                    payload["seed"] = int(f2_seed)
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": f2_prompt.strip()})
+
+            # -------- FLUX.2 PRO EDIT --------
+            elif selected_model_id == "fal-ai/flux-2-pro/edit":
+                if not (f2e_prompt or "").strip():
+                    st.error("Please enter a prompt.")
+                    st.stop()
+                if not f2e_images:
+                    st.error("Please upload at least 1 image (image_urls required).")
+                    st.stop()
+
+                payload = {
+                    "prompt": f2e_prompt.strip(),
+                    "image_urls": [file_to_data_uri(f) for f in f2e_images],
+                    "output_format": f2e_format,
+                    "sync_mode": bool(f2e_sync),
+                    "safety_tolerance": f2e_safety,
+                    "enable_safety_checker": bool(f2e_enable_checker),
+                }
+                if f2e_size_mode == "Auto":
+                    payload["image_size"] = "auto"
+                elif f2e_size_mode == "Preset":
+                    payload["image_size"] = f2e_image_size
+                else:
+                    payload["image_size"] = {"width": int(f2e_w), "height": int(f2e_h)}
+
+                if int(f2e_seed) != 0:
+                    payload["seed"] = int(f2e_seed)
+
+                result = call_fal_model(selected_model_id, payload)
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": f2e_prompt.strip()})
+
+            # -------- IDEOGRAM V3 REFRAME --------
+            elif selected_model_id == "fal-ai/ideogram/v3/reframe":
+                # Resolve required image_url
+                if ideo_source_mode == "Upload":
+                    if not ideo_upload:
+                        st.error("Please upload an image.")
+                        st.stop()
+                    resolved_image_url = file_to_data_uri(ideo_upload)
+                else:
+                    if not (ideo_image_url_text or "").strip():
+                        st.error("Please enter an image URL.")
+                        st.stop()
+                    resolved_image_url = ideo_image_url_text.strip()
+
+                # Style rules:
+                style_codes_list = []
+                if (ideo_style_codes or "").strip():
+                    style_codes_list = [s.strip() for s in ideo_style_codes.split(",") if s.strip()]
+
+                # If style codes present, cannot use style or reference images
+                if style_codes_list and ideo_ref_images:
+                    st.warning("Ideogram: When Style Codes are provided, Style Reference Images are not allowed. Ignoring reference images.")
+                    ideo_ref_images = None
+
+                payload = {
+                    "image_url": resolved_image_url,
+                    "image_size": ideo_image_size_mode,
+                    "rendering_speed": ideo_render_speed,
+                    "num_images": int(ideo_num_images),
+                    "sync_mode": bool(ideo_sync),
+                }
+                if int(ideo_seed) != 0:
+                    payload["seed"] = int(ideo_seed)
+
+                if ideo_palette and (ideo_palette.get("name") or ideo_palette.get("members")):
+                    payload["color_palette"] = ideo_palette
+
+                if style_codes_list:
+                    payload["style_codes"] = style_codes_list
+                else:
+                    if ideo_style != "(none)":
+                        payload["style"] = ideo_style
+                    if (ideo_style_preset or "").strip():
+                        payload["style_preset"] = ideo_style_preset.strip()
+                    if ideo_ref_images:
+                        payload["image_urls"] = [file_to_data_uri(f) for f in ideo_ref_images]
+
+                result = call_fal_model(selected_model_id, payload)
+
+                images = result.get("images") or []
+                urls = [img.get("url") for img in images if img.get("url")]
+                if not urls:
+                    st.error("No images returned.")
+                    st.stop()
+
+                cols = st.columns(min(len(urls), 2))
+                for i, url in enumerate(urls):
+                    cols[i % len(cols)].image(url, use_column_width=True)
+
+                add_history_item(
+                    selected_model_label,
+                    selected_model_id,
+                    "image",
+                    urls,
+                    {
+                        "image_size": ideo_image_size_mode,
+                        "rendering_speed": ideo_render_speed,
+                        "style": None if ideo_style == "(none)" else ideo_style,
+                        "style_preset": (ideo_style_preset or "").strip() or None,
+                    },
+                )
+
+            else:
+                st.error("Model not wired yet.")
+                st.stop()
+
+    except Exception as e:
+        st.error("Something went wrong while calling the FAL API.")
+        st.code(str(e))
