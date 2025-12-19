@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 import streamlit.components.v1 as components
 from pathlib import Path
 import uuid
+import tempfile
+import io
+from PIL import Image
 
 
 # -----------------------------
@@ -99,12 +102,75 @@ def _hash(s: str) -> str:
 
 
 def file_to_data_uri(uploaded_file) -> str | None:
-    """Convert Streamlit UploadedFile to base64 data URI (works as url for FAL)."""
+    """
+    Convert Streamlit UploadedFile to base64 data URI.
+    NOTE: Base64 inflates size ~33%, and the FAL gateway enforces a ~10MB request-body limit.
+    For large images, prefer uploading and passing a hosted URL instead.
+    """
     if uploaded_file is None:
         return None
-    file_bytes = uploaded_file.read()
+    file_bytes = uploaded_file.getvalue()
     b64 = base64.b64encode(file_bytes).decode("utf-8")
-    mime = uploaded_file.type or "application/octet-stream"
+    mime = getattr(uploaded_file, "type", None) or "application/octet-stream"
+    return f"data:{mime};base64,{b64}"
+
+
+def file_to_fal_url_or_data_uri(
+    uploaded_file,
+    *,
+    upload_large_files: bool = True,
+    max_request_body_bytes: int = 10_485_760,  # 10MB
+    safety_margin_bytes: int = 900_000,        # room for JSON + prompt
+) -> str | None:
+    """
+    Returns either:
+      - a base64 data URI (small files), or
+      - a hosted URL uploaded to fal.media via fal-client (large files).
+
+    This avoids 413 "Maximum request body size 10485760 exceeded" when inlining large files.
+    """
+    if uploaded_file is None:
+        return None
+
+    file_bytes = uploaded_file.getvalue()
+    mime = getattr(uploaded_file, "type", None) or "application/octet-stream"
+
+    # Rough estimate of the request body if we inline the file as a data URI.
+    # base64 expands by ~4/3, plus the "data:mime;base64," header and JSON quoting overhead.
+    estimated_inline_bytes = int(len(file_bytes) * 4 / 3) + len(mime) + 64
+
+    if upload_large_files and estimated_inline_bytes > (max_request_body_bytes - safety_margin_bytes):
+        try:
+            import fal_client  # pip install fal-client
+        except Exception as e:
+            raise RuntimeError(
+                "Input image is too large to inline as base64 (would exceed the ~10MB request limit). "
+                "Install 'fal-client' so the app can upload the file to fal.media and pass a URL instead:\n"
+                "  pip install fal-client\n"
+                f"Original import error: {e}"
+            )
+
+        # Ensure fal-client can see the key (it reads from env var FAL_KEY)
+        if not os.environ.get("FAL_KEY") and "FAL_KEY" in st.secrets:
+            os.environ["FAL_KEY"] = st.secrets["FAL_KEY"]
+
+        # Upload via fal.media CDN, return URL
+        suffix = Path(getattr(uploaded_file, "name", "")).suffix or ".bin"
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            return fal_client.upload_file(tmp_path)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    # Small enough to inline
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
 
@@ -337,6 +403,466 @@ def openai_images_edit(
 
 
 
+
+# -----------------------------
+# PROMPT HELPER (OpenAI LLM)
+# -----------------------------
+def openai_make_pipeline_prompts(
+    user_prompt: str,
+    reference_image,
+    storyboard_image,
+    model: str = "gpt-4o-mini",
+) -> dict:
+    """
+    Uses OpenAI Responses API (multimodal) to generate:
+      - enhanced_prompt (for T2I if needed)
+      - step1_prompt / step2_prompt / step3_prompt (for I2I steps)
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing (add it to secrets.toml or env vars).")
+
+    url = "https://api.openai.com/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    def _bytes_to_small_data_url(img_bytes: bytes, max_side: int = 1024, target_max_bytes: int = 6_000_000) -> str:
+        """
+        Convert raw image bytes to a reasonably small JPEG data URL so the OpenAI API
+        doesn't need to download a huge remote URL (and stays under size limits).
+        """
+        try:
+            im = Image.open(io.BytesIO(img_bytes))
+        except Exception:
+            # If we can't decode it, fall back to a naive data url (may still error).
+            return "data:image/png;base64," + base64.b64encode(img_bytes).decode("utf-8")
+
+        # Convert to RGB for JPEG
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        elif im.mode == "L":
+            im = im.convert("RGB")
+
+        # Resize if needed
+        w, h = im.size
+        scale = min(1.0, float(max_side) / float(max(w, h)))
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+
+        # Encode with adaptive quality to stay small
+        quality = 85
+        out = io.BytesIO()
+        while True:
+            out.seek(0)
+            out.truncate(0)
+            im.save(out, format="JPEG", quality=quality, optimize=True)
+            data = out.getvalue()
+            if len(data) <= target_max_bytes or quality <= 45:
+                break
+            quality -= 10
+
+        return "data:image/jpeg;base64," + base64.b64encode(data).decode("utf-8")
+
+    def _as_input_image(x) -> dict:
+        # Accept bytes (local uploads) or str (URL/data URL).
+        if isinstance(x, (bytes, bytearray)):
+            return {"type": "input_image", "image_url": _bytes_to_small_data_url(bytes(x))}
+        if isinstance(x, str):
+            return {"type": "input_image", "image_url": x}
+        raise RuntimeError("Invalid image input for OpenAI prompt helper (expected bytes or URL string).")
+
+    system_text = (
+        "You are a senior prompt engineer for image generation.\n"
+        "Goal: Transform the REFERENCE image toward the STORYBOARD image while honoring the USER PROMPT.\n"
+        "Return concise, production-ready prompts.\n"
+        "Avoid copyrighted characters/logos and avoid mentioning any real person.\n"
+        "Focus on: subject, composition, camera, lighting, materials, mood, background, and key details.\n"
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "enhanced_prompt": {"type": "string"},
+            "step1_prompt": {"type": "string"},
+            "step2_prompt": {"type": "string"},
+            "step3_prompt": {"type": "string"},
+            "negative_prompt": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        "required": ["enhanced_prompt", "step1_prompt", "step2_prompt", "step3_prompt", "negative_prompt", "notes"],
+        "additionalProperties": False,
+    }
+
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_text}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"USER PROMPT:\n{user_prompt.strip()}"},
+                    {"type": "input_text", "text": "REFERENCE IMAGE (starting point):"},
+                    _as_input_image(reference_image),
+                    {"type": "input_text", "text": "STORYBOARD IMAGE (target direction):"},
+                    _as_input_image(storyboard_image),
+                    {"type": "input_text", "text": "Generate prompts that apply storyboard direction onto the reference image."},
+                ],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "pipeline_prompts",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI prompt helper error {r.status_code}: {r.text[:800]}")
+
+    data = r.json()
+    # Pull the JSON text from the response
+    try:
+        text_out = data.get("output", [])[0].get("content", [])[0].get("text")
+        return json.loads(text_out)
+    except Exception:
+        # Fallback: try to find any text content
+        for item in data.get("output", []):
+            for c in item.get("content", []):
+                if isinstance(c, dict) and c.get("type") == "output_text":
+                    try:
+                        return json.loads(c.get("text", "{}"))
+                    except Exception:
+                        pass
+        raise RuntimeError("OpenAI prompt helper returned an unexpected format.")
+
+
+# -----------------------------
+# PIPELINE HELPERS
+# -----------------------------
+def _extract_image_urls(result: dict) -> list[str]:
+    urls = []
+    imgs = result.get("images") if isinstance(result, dict) else None
+    if isinstance(imgs, list):
+        for im in imgs:
+            if isinstance(im, dict) and im.get("url"):
+                urls.append(im["url"])
+    # Some endpoints might use "image" or "output" fields; keep minimal.
+    return urls
+
+
+def _build_fal_edit_payload(model_id: str, prompt: str, image_urls: list[str], *, mask_url: str | None = None,
+                           num_images: int = 1, output_format: str = "png",
+                           image_size: str = "auto", quality: str = "high", background: str = "auto",
+                           input_fidelity: str = "high") -> dict:
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ValueError("Empty prompt")
+
+    # Model-specific knobs (use safe defaults)
+    if model_id == "fal-ai/gpt-image-1.5/edit":
+        payload = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "mask_image_url": mask_url,
+            "num_images": int(num_images),
+            "image_size": image_size,
+            "quality": quality,
+            "background": background,
+            "input_fidelity": input_fidelity,
+            "output_format": output_format,
+            "sync_mode": False,
+        }
+        return {k: v for k, v in payload.items() if v is not None}
+
+    if model_id == "fal-ai/nano-banana-pro/edit":
+        payload = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "num_images": int(num_images),
+            "output_format": output_format,
+            "aspect_ratio": None,      # auto
+            "resolution": "2K",        # good default
+        }
+        return {k: v for k, v in payload.items() if v is not None}
+
+    if "/seedream/" in model_id and model_id.endswith("/edit"):
+        # Seedream expects image_size object in the single-mode UI, but also works with defaults.
+        payload = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "num_images": int(num_images),
+            "output_format": output_format,
+        }
+        return {k: v for k, v in payload.items() if v is not None}
+
+    if model_id == "fal-ai/flux-2-pro/edit":
+        payload = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "output_format": output_format,
+            "sync_mode": False,
+            "enable_safety_checker": True,
+        }
+        return {k: v for k, v in payload.items() if v is not None}
+
+    # Generic edit payload (many fal edit endpoints accept these)
+    payload = {
+        "prompt": prompt,
+        "image_urls": image_urls,
+        "num_images": int(num_images),
+        "output_format": output_format,
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def render_pipeline_ui():
+    st.subheader("3-Step Pipeline")
+
+    # Initialize pipeline session state
+    for k, v in {
+        "pipe_prompts": None,
+        "pipe_step1_urls": None,
+        "pipe_selected_idx": 0,
+        "pipe_step2_url": None,
+        "pipe_step3_url": None,
+    }.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    # Pipeline-capable model lists (edit-first)
+    edit_models = {label: mid for label, mid in MODEL_OPTIONS.items()
+                   if mid.startswith("fal-ai") and ("/edit" in mid or "reframe" in mid or "kontext" in mid)}
+    # Prefer the most useful ones first
+    preferred_order = [
+        "GPT Image 1.5 (FAL) Edit (Image + Text → Image)",
+        "FLUX.2 Pro Edit (Image → Image)",
+        "Seedream 4.5 Edit (Image + Text → Image)",
+        "Seedream 4.0 Edit (Image + Text → Image)",
+        "Nano Banana Pro Edit (Image + Text → Image)",
+    ]
+    ordered_labels = [x for x in preferred_order if x in edit_models] + [x for x in edit_models.keys() if x not in preferred_order]
+
+    left, right = st.columns([1, 1])
+
+    with right:
+        st.markdown("### Results")
+        if st.session_state.pipe_step1_urls:
+            st.markdown("**Step 1 outputs** (pick one to continue):")
+            cols = st.columns(4)
+            for i, url in enumerate(st.session_state.pipe_step1_urls):
+                with cols[i % 4]:
+                    st.image(url, use_container_width=True)
+                    if st.button(f"Use #{i+1}", key=f"pick_{i}"):
+                        st.session_state.pipe_selected_idx = i
+                        st.session_state.pipe_step2_url = None
+                        st.session_state.pipe_step3_url = None
+                        st.rerun()
+
+        if st.session_state.pipe_step2_url:
+            st.markdown("**Step 2 output**")
+            st.image(st.session_state.pipe_step2_url, use_container_width=True)
+
+        if st.session_state.pipe_step3_url:
+            st.markdown("**Final (Step 3) output**")
+            st.image(st.session_state.pipe_step3_url, use_container_width=True)
+
+    with left:
+        st.markdown("### Inputs")
+        mode_help = "Pipeline mode: LLM writes prompts, then 3 models apply edits in sequence."
+        st.caption(mode_help)
+
+        user_prompt = st.text_area("What do you want to create?", key="pipe_user_prompt")
+
+        ref_file = st.file_uploader("Reference image (starting point)", type=["png", "jpg", "jpeg", "webp"], key="pipe_ref")
+        story_file = st.file_uploader("Storyboard image (target direction)", type=["png", "jpg", "jpeg", "webp"], key="pipe_story")
+        mask_file = st.file_uploader("Optional mask (PNG)", type=["png"], key="pipe_mask")
+
+        st.markdown("### Step models")
+        step1_label = st.selectbox("Step 1 model (creates the first version)", ordered_labels, index=0, key="pipe_step1_model")
+        step2_label = st.selectbox("Step 2 model (refine)", ordered_labels, index=min(1, len(ordered_labels)-1), key="pipe_step2_model")
+        step3_label = st.selectbox("Step 3 model (final polish)", ordered_labels, index=min(2, len(ordered_labels)-1), key="pipe_step3_model")
+
+        step1_id = edit_models[step1_label]
+        step2_id = edit_models[step2_label]
+        step3_id = edit_models[step3_label]
+
+        st.markdown("### Output settings")
+        output_format = st.selectbox("Format", ["png", "jpeg", "webp"], index=0, key="pipe_fmt")
+        quality = st.selectbox("Quality", ["high", "medium", "low"], index=0, key="pipe_quality")
+        background = st.selectbox("Background", ["auto", "opaque", "transparent"], index=0, key="pipe_bg")
+        image_size = st.selectbox("Image size", ["auto", "1024x1024", "1536x1024", "1024x1536"], index=0, key="pipe_size")
+
+        step1_n = st.slider("Step 1 variations", 1, 4, 2, key="pipe_n")  # 4 is safe for most fal image endpoints
+
+        st.markdown("### Prompt helper")
+        use_llm = st.checkbox("Use GPT‑4o mini to write prompts from (prompt + reference + storyboard)", value=True, key="pipe_use_llm")
+        if use_llm and not OPENAI_API_KEY:
+            st.warning("OPENAI_API_KEY missing. Add it to secrets.toml to enable the prompt helper.")
+        gen_prompts_btn = st.button("✨ Generate prompts", use_container_width=True, disabled=(use_llm and not OPENAI_API_KEY))
+
+        # Resolve reference/storyboard URLs for both OpenAI + FAL
+        ref_url = None
+        story_url = None
+        mask_url = None
+        if ref_file:
+            ref_url = file_to_fal_url_or_data_uri(ref_file, upload_large_files=True)
+        if story_file:
+            story_url = file_to_fal_url_or_data_uri(story_file, upload_large_files=True)
+        if mask_file:
+            mask_url = file_to_fal_url_or_data_uri(mask_file, upload_large_files=True)
+
+        if gen_prompts_btn:
+            if not (user_prompt or "").strip():
+                st.error("Please write a prompt first.")
+                st.stop()
+            if not ref_file or not story_file:
+                st.error("Please upload both a reference image and a storyboard image.")
+                st.stop()
+            with st.spinner("Generating prompts with GPT‑4o mini…"):
+                pack = openai_make_pipeline_prompts(user_prompt, ref_file.getvalue(), story_file.getvalue(), model="gpt-4o-mini")
+                st.session_state.pipe_prompts = pack
+                st.rerun()
+
+        # Editable prompts (persist)
+        if st.session_state.pipe_prompts is None:
+            st.session_state.pipe_prompts = {
+                "enhanced_prompt": "",
+                "step1_prompt": "",
+                "step2_prompt": "",
+                "step3_prompt": "",
+                "negative_prompt": "",
+                "notes": "",
+            }
+
+        pp = st.session_state.pipe_prompts
+        pp["enhanced_prompt"] = st.text_area("Enhanced prompt (optional)", value=pp.get("enhanced_prompt",""), key="pipe_enhanced")
+        pp["step1_prompt"] = st.text_area("Step 1 prompt", value=pp.get("step1_prompt",""), key="pipe_p1")
+        pp["step2_prompt"] = st.text_area("Step 2 prompt", value=pp.get("step2_prompt",""), key="pipe_p2")
+        pp["step3_prompt"] = st.text_area("Step 3 prompt", value=pp.get("step3_prompt",""), key="pipe_p3")
+        pp["negative_prompt"] = st.text_area("Negative prompt (optional)", value=pp.get("negative_prompt",""), key="pipe_neg")
+
+        st.markdown("---")
+        run_all_btn = st.button("🚀 Run pipeline", type="primary", use_container_width=True)
+
+        if run_all_btn:
+            if not FAL_API_KEY:
+                st.error("FAL_KEY is missing.")
+                st.stop()
+            if not (user_prompt or "").strip():
+                st.error("Please write a prompt.")
+                st.stop()
+            if not ref_url:
+                st.error("Please upload a reference image.")
+                st.stop()
+
+            # If storyboard is missing, we still allow pipeline, but prompts should describe the target.
+            if story_url is None:
+                st.warning("No storyboard image uploaded. The pipeline will rely on your written prompt only.")
+
+            # If LLM is enabled but prompts are blank, auto-generate once
+            if use_llm and OPENAI_API_KEY and (not (pp.get("step1_prompt") or "").strip()):
+                if not story_url:
+                    st.error("To auto-generate prompts, please upload a storyboard image too.")
+                    st.stop()
+                with st.spinner("Generating prompts with GPT‑4o mini…"):
+                    pack = openai_make_pipeline_prompts(user_prompt, ref_file.getvalue(), story_file.getvalue(), model="gpt-4o-mini")
+                    st.session_state.pipe_prompts = pack
+                    pp = pack
+
+            # Step 1
+            step1_images = [ref_url] + ([story_url] if story_url else [])
+            payload1 = _build_fal_edit_payload(
+                step1_id,
+                pp.get("step1_prompt") or user_prompt,
+                step1_images,
+                mask_url=mask_url,
+                num_images=int(step1_n),
+                output_format=output_format,
+                image_size=image_size,
+                quality=quality,
+                background=background,
+            )
+            with st.spinner("Running Step 1…"):
+                res1 = call_fal_model(step1_id, payload1)
+            urls1 = _extract_image_urls(res1)
+            if not urls1:
+                st.error("Step 1 returned no images.")
+                st.stop()
+            st.session_state.pipe_step1_urls = urls1
+            st.session_state.pipe_selected_idx = 0
+
+            # If multiple, let user choose before continuing
+            if len(urls1) > 1:
+                st.info("Step 1 produced multiple images. Pick one on the right, then click 'Run pipeline' again to continue.")
+                st.rerun()
+
+            chosen = urls1[0]
+
+            # Step 2
+            payload2 = _build_fal_edit_payload(
+                step2_id,
+                pp.get("step2_prompt") or user_prompt,
+                [chosen],
+                mask_url=None,
+                num_images=1,
+                output_format=output_format,
+                image_size=image_size,
+                quality=quality,
+                background=background,
+            )
+            with st.spinner("Running Step 2…"):
+                res2 = call_fal_model(step2_id, payload2)
+            urls2 = _extract_image_urls(res2)
+            if not urls2:
+                st.error("Step 2 returned no images.")
+                st.stop()
+            st.session_state.pipe_step2_url = urls2[0]
+
+            # Step 3
+            payload3 = _build_fal_edit_payload(
+                step3_id,
+                pp.get("step3_prompt") or user_prompt,
+                [urls2[0]],
+                mask_url=None,
+                num_images=1,
+                output_format=output_format,
+                image_size=image_size,
+                quality=quality,
+                background=background,
+            )
+            with st.spinner("Running Step 3…"):
+                res3 = call_fal_model(step3_id, payload3)
+            urls3 = _extract_image_urls(res3)
+            if not urls3:
+                st.error("Step 3 returned no images.")
+                st.stop()
+            st.session_state.pipe_step3_url = urls3[0]
+
+            # Save to history as one "pipeline" entry
+            add_history(
+                model="pipeline",
+                model_label=f"Pipeline: {step1_label} → {step2_label} → {step3_label}",
+                prompt=user_prompt,
+                result_urls=[st.session_state.pipe_step3_url],
+                extra={
+                    "step1": {"model": step1_id, "images": urls1},
+                    "step2": {"model": step2_id, "image": st.session_state.pipe_step2_url},
+                    "step3": {"model": step3_id, "image": st.session_state.pipe_step3_url},
+                    "prompts": st.session_state.pipe_prompts,
+                },
+            )
+
+            st.success("Pipeline complete.")
+            st.rerun()
+
 # -----------------------------
 # MODEL OPTIONS
 # -----------------------------
@@ -499,6 +1025,20 @@ if st.session_state.page == "History":
 # GENERATOR PAGE
 # =========================================================
 st.header("Generator")
+
+# Mode switch: Single vs Pipeline
+gen_mode = st.radio(
+    "Mode",
+    ["Single model", "3-step pipeline"],
+    horizontal=True,
+    index=0,
+    key="gen_mode",
+)
+
+if gen_mode == "3-step pipeline":
+    render_pipeline_ui()
+    st.stop()
+
 
 selected_model_label = st.selectbox("Choose model", list(MODEL_OPTIONS.keys()))
 selected_model_id = MODEL_OPTIONS[selected_model_label]
@@ -1095,8 +1635,8 @@ if run_btn:
 
                 payload = {
                     "prompt": gi_edit_prompt.strip(),
-                    "image_urls": [file_to_data_uri(f) for f in gi_edit_images],
-                    "mask_image_url": file_to_data_uri(gi_mask) if gi_mask else None,
+                    "image_urls": [file_to_fal_url_or_data_uri(f) for f in gi_edit_images],
+                    "mask_image_url": file_to_fal_url_or_data_uri(gi_mask) if gi_mask else None,
                     "num_images": int(gi_edit_num_images),
                     "image_size": gi_edit_image_size,
                     "background": gi_edit_background,
@@ -1536,4 +2076,3 @@ if run_btn:
     except Exception as e:
         st.error("Something went wrong while calling the FAL API.")
         st.code(str(e))
-    
