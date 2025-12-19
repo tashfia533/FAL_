@@ -67,5 +67,35 @@
       "image_size": "1536x1024",
       "quality": "high"
     }
+  },
+  {
+    "timestamp": "2025-12-19T06:50:17.890271+00:00",
+    "model_label": "GPT Image 1.5 (FAL) (Text → Image)",
+    "model": "fal-ai/gpt-image-1.5",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a86e559/uePXrYGsuAhzj5im5m6gz.png"
+    ],
+    "meta": {
+      "prompt": "a jordanian temple in ruins, a close up on the ground, shards of stone and a little bit of wood, theres a small shine of light on the middle of the shot, hipper realistic,  30 degree camera angle pointing to the floor, upclose,",
+      "image_size": "1024x1024",
+      "quality": "high"
+    }
+  },
+  {
+    "timestamp": "2025-12-19T06:53:45.783014+00:00",
+    "model_label": "GPT Image 1.5 (FAL) (Text → Image)",
+    "model": "fal-ai/gpt-image-1.5",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a86e56f/UYnPlSlcvllqx4OQ-_hQC.png",
+      "https://v3b.fal.media/files/b/0a86e56f/6VV3Rtr8iQXn5tBzAmOsH.png",
+      "https://v3b.fal.media/files/b/0a86e56f/ZUoptYH9SeFYS6D044Hy-.png"
+    ],
+    "meta": {
+      "prompt": "a jordanian temple in ruins, a close up on the ground, shards of stone and a little bit of wood, theres a small shine of light on the middle of the shot, hipper realistic,  35 degree camera angle pointing to the floor, upclose, no rubble, more desert like,",
+      "image_size": "1024x1024",
+      "quality": "high"
+    }
   }
 ]
