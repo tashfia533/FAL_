@@ -97,5 +97,33 @@
       "image_size": "1024x1024",
       "quality": "high"
     }
+  },
+  {
+    "timestamp": "2025-12-26T08:51:25.124131+00:00",
+    "model_label": "GPT Image 1.5 (FAL) (Text → Image)",
+    "model": "fal-ai/gpt-image-1.5",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a87d470/iP66r84PETgNTUcV3fikA.png"
+    ],
+    "meta": {
+      "prompt": "a banana trying to escape a sinking boat in the middle of the ocean, with a starry sky",
+      "image_size": "1024x1024",
+      "quality": "high"
+    }
+  },
+  {
+    "timestamp": "2025-12-26T08:52:41.845052+00:00",
+    "model_label": "OpenAI GPT Image 1.5 (Text → Image)",
+    "model": "openai/gpt-image-1.5",
+    "kind": "image",
+    "urls": [
+      "C:\\Users\\felip\\Desktop\\KS\\FAL_\\openai_outputs\\openai_20251226T085241Z_5fb8a74c9a.png"
+    ],
+    "meta": {
+      "prompt": "a banana trying to escape a sinking boat in the middle of the ocean, with a starry sky",
+      "size": "auto",
+      "quality": "auto"
+    }
   }
 ]
