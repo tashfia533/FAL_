@@ -2026,6 +2026,10 @@ if run_btn:
                 st.error("Model not wired yet.")
                 st.stop()
 
+
     except Exception as e:
         st.error("Something went wrong while calling the FAL API.")
         st.code(str(e))
+
+
+
