@@ -199,11 +199,90 @@ def save_history(history):
         st.warning(f"Could not save history: {e}")
 
 
-def add_history_item(model_label, model_id, kind, urls, meta=None):
-    """Store history. UI will NOT show time/type, but we keep timestamp for sorting."""
+def _get_image_dimensions(url: str) -> tuple[int, int] | None:
+    """Get image dimensions from URL. Returns (width, height) or None if unavailable."""
+    try:
+        img_ref = _normalize_image_ref(url)
+        if not img_ref:
+            return None
+        
+        # For data URIs, decode directly
+        if img_ref.startswith("data:"):
+            header, encoded = img_ref.split(",", 1)
+            img_bytes = base64.b64decode(encoded)
+            img = Image.open(io.BytesIO(img_bytes))
+            return img.size
+        
+        # For URLs or file paths, try to open
+        if img_ref.startswith(("http://", "https://")):
+            # Download image
+            response = requests.get(img_ref, timeout=10)
+            response.raise_for_status()
+            img = Image.open(io.BytesIO(response.content))
+            return img.size
+        else:
+            # Local file path
+            img = Image.open(img_ref)
+            return img.size
+    except Exception:
+        return None
+
+
+def _calculate_aspect_ratio(width: int, height: int) -> str:
+    """Calculate aspect ratio string like '16:9' or '1:1'."""
+    if width == 0 or height == 0:
+        return "N/A"
+    
+    def gcd(a, b):
+        while b:
+            a, b = b, a % b
+        return a
+    
+    g = gcd(width, height)
+    w_ratio = width // g
+    h_ratio = height // g
+    
+    # Common ratios
+    common_ratios = {
+        (1, 1): "1:1",
+        (4, 3): "4:3",
+        (16, 9): "16:9",
+        (9, 16): "9:16",
+        (3, 2): "3:2",
+        (2, 3): "2:3",
+        (21, 9): "21:9",
+    }
+    
+    return common_ratios.get((w_ratio, h_ratio), f"{w_ratio}:{h_ratio}")
+
+
+def add_history_item(model_label, model_id, kind, urls, meta=None, is_pipeline=False):
+    """Store history with enhanced metadata including dimensions, aspect ratio, and pipeline flag."""
     if not urls:
         return
     history = load_history()
+    
+    # Get dimensions for the first image (or video thumbnail if applicable)
+    dimensions = None
+    aspect_ratio = None
+    resolution = None
+    
+    if kind == "image" and urls:
+        dims = _get_image_dimensions(urls[0])
+        if dims:
+            width, height = dims
+            dimensions = {"width": width, "height": height}
+            aspect_ratio = _calculate_aspect_ratio(width, height)
+            resolution = f"{width}x{height}"
+    
+    # Enhance meta with dimensions and pipeline info
+    enhanced_meta = meta.copy() if meta else {}
+    if dimensions:
+        enhanced_meta["dimensions"] = dimensions
+        enhanced_meta["aspect_ratio"] = aspect_ratio
+        enhanced_meta["resolution"] = resolution
+    enhanced_meta["is_pipeline"] = is_pipeline
+    
     history.append(
         {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -211,7 +290,7 @@ def add_history_item(model_label, model_id, kind, urls, meta=None):
             "model": model_id,
             "kind": kind,  # image | video
             "urls": urls,
-            "meta": meta or {},
+            "meta": enhanced_meta,
         }
     )
     # Optional: keep file from growing forever
@@ -695,22 +774,44 @@ def _build_fal_edit_payload(model_id: str, prompt: str, image_urls: list[str], *
         return {k: v for k, v in payload.items() if v is not None}
 
     if model_id == "fal-ai/flux-2-pro/edit":
-        payload = {
-            "prompt": prompt,
-            "image_urls": image_urls,
-            "output_format": output_format,
-            "sync_mode": False,
-            "enable_safety_checker": True,
-        }
+        # FLUX.2 Pro Edit can accept either image_url (single) or image_urls (multiple)
+        if len(image_urls) == 1:
+            payload = {
+                "prompt": prompt,
+                "image_url": image_urls[0],  # Use singular for single image
+                "output_format": output_format,
+                "sync_mode": False,
+                "enable_safety_checker": True,
+            }
+        else:
+            payload = {
+                "prompt": prompt,
+                "image_urls": image_urls,
+                "output_format": output_format,
+                "sync_mode": False,
+                "enable_safety_checker": True,
+            }
         return {k: v for k, v in payload.items() if v is not None}
 
     # Generic edit payload (many fal edit endpoints accept these)
-    payload = {
-        "prompt": prompt,
-        "image_urls": image_urls,
-        "num_images": int(num_images),
-        "output_format": output_format,
-    }
+    # Some models expect image_url (singular) when there's only one image
+    # For models that aren't explicitly handled above, try image_url for single images
+    if len(image_urls) == 1:
+        # Try both formats - some models prefer image_url, others image_urls
+        # We'll try image_url first as it's more common for single-image edits
+        payload = {
+            "prompt": prompt,
+            "image_url": image_urls[0],  # Singular for single image
+            "num_images": int(num_images),
+            "output_format": output_format,
+        }
+    else:
+        payload = {
+            "prompt": prompt,
+            "image_urls": image_urls,  # Plural for multiple images
+            "num_images": int(num_images),
+            "output_format": output_format,
+        }
     return {k: v for k, v in payload.items() if v is not None}
 
 
@@ -776,7 +877,11 @@ def render_pipeline_ui():
         "pipe_prompts": None,
         "pipe_step1_urls": None,
         "pipe_selected_idx": 0,
+        "pipe_step2_urls": None,
+        "pipe_step2_selected_idx": 0,
         "pipe_step2_url": None,
+        "pipe_step3_urls": None,
+        "pipe_step3_selected_idx": 0,
         "pipe_step3_url": None,
     }.items():
         if k not in st.session_state:
@@ -800,25 +905,91 @@ def render_pipeline_ui():
     with right:
         st.markdown("### Results")
         if st.session_state.pipe_step1_urls:
-            st.markdown("**Step 1 outputs** (pick one to continue):")
+            st.markdown("**Step 1 outputs** (click an image to select and run Steps 2 & 3):")
             cols = st.columns(4)
+            selected_idx = st.session_state.get("pipe_selected_idx", 0)
+            
             for i, url in enumerate(st.session_state.pipe_step1_urls):
                 with cols[i % 4]:
-                    safe_st_image(url, caption=str(url), width='stretch')
-                    if st.button(f"Use #{i+1}", key=f"pick_{i}"):
-                        # Store the chosen Step 1 image URL and immediately continue to Step 2/3
-                        st.session_state.pipe_selected_idx = i
-                        st.session_state.pipe_chosen_url = url
-                        st.session_state.pipe_autorun_step23 = True
-                        st.session_state.pipe_step2_url = None
-                        st.session_state.pipe_step3_url = None
-                        st.rerun()
+                    # Visual feedback for selected image
+                    is_selected = (i == selected_idx)
+                    border_color = "#FF4B4B" if is_selected else "rgba(49, 51, 63, 0.2)"
+                    border_width = "3px" if is_selected else "1px"
+                    
+                    st.markdown(
+                        f'<div style="border: {border_width} solid {border_color}; border-radius: 8px; padding: 4px; background: {"rgba(255, 75, 75, 0.1)" if is_selected else "transparent"}; transition: all 0.2s;">',
+                        unsafe_allow_html=True
+                    )
+                    safe_st_image(url, caption=f"Image #{i+1}", width='stretch')
+                    if is_selected:
+                        st.markdown("✅ **Selected** - Running Steps 2 & 3...", help="This image is being used for Steps 2 & 3")
+                    else:
+                        # Button to select this image
+                        if st.button(f"Select & Run", key=f"select_{i}", width='stretch'):
+                            # Store the chosen Step 1 image URL and immediately continue to Step 2/3
+                            st.session_state.pipe_selected_idx = i
+                            st.session_state.pipe_chosen_url = url
+                            st.session_state.pipe_autorun_step23 = True
+                            st.session_state.pipe_step2_url = None
+                            st.session_state.pipe_step3_url = None
+                            st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
 
-        if st.session_state.pipe_step2_url:
+        if st.session_state.pipe_step2_urls:
+            st.markdown("**Step 2 outputs** (select one to continue to Step 3):")
+            cols = st.columns(4)
+            selected_idx2 = st.session_state.get("pipe_step2_selected_idx", 0)
+            
+            for i, url in enumerate(st.session_state.pipe_step2_urls):
+                with cols[i % 4]:
+                    # Visual feedback for selected image
+                    is_selected = (i == selected_idx2)
+                    border_color = "#FF4B4B" if is_selected else "rgba(49, 51, 63, 0.2)"
+                    border_width = "3px" if is_selected else "1px"
+                    
+                    st.markdown(
+                        f'<div style="border: {border_width} solid {border_color}; border-radius: 8px; padding: 4px; background: {"rgba(255, 75, 75, 0.1)" if is_selected else "transparent"}; transition: all 0.2s;">',
+                        unsafe_allow_html=True
+                    )
+                    safe_st_image(url, caption=f"Image #{i+1}", width='stretch')
+                    if is_selected:
+                        st.markdown("✅ **Selected** - Ready for Step 3", help="This image will be used for Step 3")
+                    else:
+                        # Button to select this image
+                        if st.button(f"Select & Run Step 3", key=f"select_step2_{i}", width='stretch'):
+                            # Store the chosen Step 2 image URL and continue to Step 3
+                            st.session_state.pipe_step2_selected_idx = i
+                            st.session_state.pipe_step2_url = url
+                            st.session_state.pipe_autorun_step3 = True
+                            st.session_state.pipe_step3_urls = None
+                            st.session_state.pipe_step3_url = None
+                            st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+        elif st.session_state.pipe_step2_url:
             st.markdown("**Step 2 output**")
             safe_st_image(st.session_state.pipe_step2_url, caption=str(st.session_state.pipe_step2_url), width='stretch')
 
-        if st.session_state.pipe_step3_url:
+        if st.session_state.pipe_step3_urls:
+            st.markdown("**Step 3 outputs** (final results):")
+            cols = st.columns(4)
+            selected_idx3 = st.session_state.get("pipe_step3_selected_idx", 0)
+            
+            for i, url in enumerate(st.session_state.pipe_step3_urls):
+                with cols[i % 4]:
+                    # Visual feedback for selected image
+                    is_selected = (i == selected_idx3)
+                    border_color = "#FF4B4B" if is_selected else "rgba(49, 51, 63, 0.2)"
+                    border_width = "3px" if is_selected else "1px"
+                    
+                    st.markdown(
+                        f'<div style="border: {border_width} solid {border_color}; border-radius: 8px; padding: 4px; background: {"rgba(255, 75, 75, 0.1)" if is_selected else "transparent"}; transition: all 0.2s;">',
+                        unsafe_allow_html=True
+                    )
+                    safe_st_image(url, caption=f"Image #{i+1}", width='stretch')
+                    if is_selected:
+                        st.markdown("✅ **Selected**", help="This is the final selected image")
+                    st.markdown("</div>", unsafe_allow_html=True)
+        elif st.session_state.pipe_step3_url:
             st.markdown("**Final (Step 3) output**")
             safe_st_image(st.session_state.pipe_step3_url, caption=str(st.session_state.pipe_step3_url), width='stretch')
 
@@ -855,6 +1026,8 @@ def render_pipeline_ui():
         image_size = st.selectbox("Image size", ["auto", "1024x1024", "1536x1024", "1024x1536"], index=0, key="pipe_size")
 
         step1_n = st.slider("Step 1 variations", 1, 4, 2, key="pipe_n")  # 4 is safe for most fal image endpoints
+        step2_n = st.slider("Step 2 variations", 1, 4, 1, key="pipe_n2")  # Allow multiple for Step 2
+        step3_n = st.slider("Step 3 variations", 1, 4, 1, key="pipe_n3")  # Allow multiple for Step 3
 
         st.markdown("### Prompt helper")
         llm_model = st.selectbox("LLM model (prompt helper)", ["gpt-4o-mini"], index=0, key="pipe_llm_model")
@@ -956,14 +1129,20 @@ def render_pipeline_ui():
         pp["step3_prompt"] = st.session_state["pipe_p3"]
         pp["negative_prompt"] = st.session_state["pipe_neg"]
         pp["notes"] = st.session_state["pipe_notes"]
+        
+        # Update session state prompts to ensure latest values
+        st.session_state.pipe_prompts = pp
 
         st.markdown("---")
         run_all_btn = st.button("🚀 Run pipeline", type="primary", width='stretch')
         # If the user picked a Step 1 output, we auto-continue Step 2/3 on the next rerun.
         autorun = bool(st.session_state.pop("pipe_autorun_step23", False))
-        do_run = bool(run_all_btn or autorun)
+        autorun_step3 = bool(st.session_state.pop("pipe_autorun_step3", False))
+        do_run = bool(run_all_btn or autorun or autorun_step3)
 
         if do_run:
+            # Ensure we have the latest prompt values
+            pp = st.session_state.pipe_prompts
             if not FAL_API_KEY:
                 st.error("FAL_KEY is missing.")
                 st.stop()
@@ -1005,12 +1184,14 @@ def render_pipeline_ui():
 
             # Step 1 (always Nano Banana Pro Edit in this pipeline)
             existing_urls1 = st.session_state.get("pipe_step1_urls") or []
+            urls1 = existing_urls1  # Initialize for history save
             # If the user already generated Step 1 and selected an image, skip re-running Step 1.
             if existing_urls1 and st.session_state.get("pipe_step2_url") is None:
                 sel_idx = int(st.session_state.get("pipe_selected_idx") or 0)
                 if sel_idx < 0 or sel_idx >= len(existing_urls1):
                     sel_idx = 0
                 chosen = st.session_state.get("pipe_chosen_url") or existing_urls1[sel_idx]
+                # Continue to step 2 and 3 automatically
             else:
                 step1_images = step1_image_urls
                 payload1 = _build_fal_edit_payload(
@@ -1033,80 +1214,158 @@ def render_pipeline_ui():
                 st.session_state.pipe_step1_urls = urls1
                 st.session_state.pipe_selected_idx = 0
                 st.session_state.pipe_chosen_url = urls1[0]
+                chosen = urls1[0]  # Set chosen for this run
 
                 # Rerun so the right-side Results column can render the thumbnails/buttons.
                 if len(urls1) > 1:
                     st.info("Step 1 produced multiple images. Pick one on the right to continue (or keep #1).")
-                st.rerun()
+                    st.rerun()
 
             # From here on, we continue using the chosen Step 1 output.
+            # Ensure chosen is defined (fallback to first URL if somehow missing)
+            if 'chosen' not in locals():
+                chosen = st.session_state.get("pipe_chosen_url") or (existing_urls1[0] if existing_urls1 else None)
+                if not chosen:
+                    st.error("No Step 1 image selected. Please run Step 1 first.")
+                    st.stop()
 
-            # Step 2
-            step2_images = [chosen]
-            if include_refs_23 and step2_id == "fal-ai/nano-banana-pro/edit":
-                guides = [u for u in step1_image_urls if u and u != chosen]
-                step2_images = [chosen] + guides
-                if len(step2_images) > 14:
-                    step2_images = step2_images[:14]
+            # Step 2 - only run if Step 2 URL is not set or autorun is triggered
+            existing_urls2 = st.session_state.get("pipe_step2_urls") or []
+            if existing_urls2 and st.session_state.get("pipe_step3_url") is None and not autorun_step3:
+                # User needs to select Step 2 image first
+                sel_idx2 = int(st.session_state.get("pipe_step2_selected_idx") or 0)
+                if sel_idx2 < 0 or sel_idx2 >= len(existing_urls2):
+                    sel_idx2 = 0
+                chosen2 = st.session_state.get("pipe_step2_url") or existing_urls2[sel_idx2]
+            elif st.session_state.get("pipe_step2_url") is None or autorun:
+                # Run Step 2
+                step2_images = [chosen]
+                if include_refs_23 and step2_id == "fal-ai/nano-banana-pro/edit":
+                    guides = [u for u in step1_image_urls if u and u != chosen]
+                    step2_images = [chosen] + guides
+                    if len(step2_images) > 14:
+                        step2_images = step2_images[:14]
 
-            payload2 = _build_fal_edit_payload(
-                step2_id,
-                _with_negative((pp.get("step2_prompt") or user_prompt), pp.get("negative_prompt")),
-                step2_images,
-                mask_url=None,
-                num_images=1,
-                output_format=output_format,
-                image_size=image_size,
-                quality=quality,
-                background=background,
-            )
-            with st.spinner("Running Step 2…"):
-                res2 = call_fal_model(step2_id, payload2)
-            urls2 = _extract_image_urls(res2)
-            if not urls2:
-                st.error("Step 2 returned no images.")
-                st.stop()
-            st.session_state.pipe_step2_url = urls2[0]
+                # Ensure we have step2_prompt - use the latest from session state
+                step2_prompt = st.session_state.get("pipe_p2") or pp.get("step2_prompt") or user_prompt
+                # Ensure Step 2 prompt maintains realism and consistency
+                step2_prompt_enhanced = step2_prompt + " Maintain the same realistic style, lighting, and visual consistency from the previous step. Keep the same level of detail and photographic quality."
+                
+                payload2 = _build_fal_edit_payload(
+                    step2_id,
+                    _with_negative(step2_prompt_enhanced, pp.get("negative_prompt")),
+                    step2_images,
+                    mask_url=None,
+                    num_images=int(step2_n),
+                    output_format=output_format,
+                    image_size=image_size,  # Ensure consistent image size
+                    quality=quality,
+                    background=background,
+                )
+                with st.spinner("Running Step 2…"):
+                    res2 = call_fal_model(step2_id, payload2)
+                urls2 = _extract_image_urls(res2)
+                if not urls2:
+                    st.error("Step 2 returned no images.")
+                    st.stop()
+                st.session_state.pipe_step2_urls = urls2
+                st.session_state.pipe_step2_selected_idx = 0
+                st.session_state.pipe_step2_url = urls2[0]
+                
+                # If only one image, auto-select it; otherwise wait for user selection
+                if len(urls2) == 1:
+                    chosen2 = urls2[0]
+                else:
+                    st.info("Step 2 produced multiple images. Pick one on the right to continue to Step 3.")
+                    st.rerun()
+            else:
+                chosen2 = st.session_state.get("pipe_step2_url")
 
-            # Step 3
-            step3_images = [urls2[0]]
-            if include_refs_23 and step3_id == "fal-ai/nano-banana-pro/edit":
-                guides = [u for u in step1_image_urls if u and u != urls2[0]]
-                step3_images = [urls2[0]] + guides
-                if len(step3_images) > 14:
-                    step3_images = step3_images[:14]
+            # Step 3 - only run if Step 3 URL is not set or autorun_step3 is triggered
+            existing_urls3 = st.session_state.get("pipe_step3_urls") or []
+            if existing_urls3:
+                # User can view Step 3 results
+                pass
+            elif st.session_state.get("pipe_step3_url") is None or autorun_step3:
+                # Run Step 3
+                if not chosen2:
+                    st.error("No Step 2 image selected. Please select a Step 2 image first.")
+                    st.stop()
+                    
+                step3_images = [chosen2]
+                if include_refs_23 and step3_id == "fal-ai/nano-banana-pro/edit":
+                    guides = [u for u in step1_image_urls if u and u != chosen2]
+                    step3_images = [chosen2] + guides
+                    if len(step3_images) > 14:
+                        step3_images = step3_images[:14]
 
-            payload3 = _build_fal_edit_payload(
-                step3_id,
-                _with_negative((pp.get("step3_prompt") or user_prompt), pp.get("negative_prompt")),
-                step3_images,
-                mask_url=None,
-                num_images=1,
-                output_format=output_format,
-                image_size=image_size,
-                quality=quality,
-                background=background,
-            )
-            with st.spinner("Running Step 3…"):
-                res3 = call_fal_model(step3_id, payload3)
-            urls3 = _extract_image_urls(res3)
-            if not urls3:
-                st.error("Step 3 returned no images.")
-                st.stop()
-            st.session_state.pipe_step3_url = urls3[0]
+                # Ensure we have step3_prompt - use the latest from session state
+                step3_prompt = st.session_state.get("pipe_p3") or pp.get("step3_prompt") or user_prompt
+                # Ensure Step 3 prompt maintains realism - avoid cartoon-like effects
+                step3_prompt_enhanced = step3_prompt + " Maintain photographic realism and consistency with the previous steps. Preserve the same lighting, color grading, and visual style. Do not stylize or cartoonize - keep it photorealistic and cinematic."
+                
+                payload3 = _build_fal_edit_payload(
+                    step3_id,
+                    _with_negative(step3_prompt_enhanced, pp.get("negative_prompt")),
+                    step3_images,
+                    mask_url=None,
+                    num_images=int(step3_n),
+                    output_format=output_format,
+                    image_size=image_size,  # Ensure consistent image size
+                    quality=quality,
+                    background=background,
+                )
+                with st.spinner("Running Step 3…"):
+                    res3 = call_fal_model(step3_id, payload3)
+                urls3 = _extract_image_urls(res3)
+                if not urls3:
+                    st.error("Step 3 returned no images.")
+                    st.stop()
+                st.session_state.pipe_step3_urls = urls3
+                st.session_state.pipe_step3_selected_idx = 0
+                st.session_state.pipe_step3_url = urls3[0]
+                st.rerun()
 
             # Save to history as one "pipeline" entry
-            add_history(
-                model="pipeline",
+            # Get all step URLs from session state
+            step1_urls = urls1 if 'urls1' in locals() and urls1 else st.session_state.get("pipe_step1_urls", [])
+            step2_urls = urls2 if 'urls2' in locals() and urls2 else st.session_state.get("pipe_step2_urls", [])
+            step3_urls = urls3 if 'urls3' in locals() and urls3 else st.session_state.get("pipe_step3_urls", [])
+            
+            # Get selected indices
+            step1_selected = st.session_state.get("pipe_selected_idx", 0)
+            step2_selected = st.session_state.get("pipe_step2_selected_idx", 0)
+            step3_selected = st.session_state.get("pipe_step3_selected_idx", 0)
+            
+            add_history_item(
                 model_label=f"Pipeline: {step1_label} → {step2_label} → {step3_label}",
-                prompt=user_prompt,
-                result_urls=[st.session_state.pipe_step3_url],
-                extra={
-                    "step1": {"model": step1_id, "images": urls1},
-                    "step2": {"model": step2_id, "image": st.session_state.pipe_step2_url},
-                    "step3": {"model": step3_id, "image": st.session_state.pipe_step3_url},
+                model_id="pipeline",
+                kind="image",
+                urls=[st.session_state.pipe_step3_url],  # Final image as main URL
+                meta={
+                    "prompt": user_prompt,
+                    "step1": {
+                        "model": step1_id, 
+                        "images": step1_urls,
+                        "selected_idx": step1_selected,
+                        "selected": step1_urls[step1_selected] if step1_urls and step1_selected < len(step1_urls) else None
+                    },
+                    "step2": {
+                        "model": step2_id, 
+                        "images": step2_urls,
+                        "selected_idx": step2_selected,
+                        "selected": step2_urls[step2_selected] if step2_urls and step2_selected < len(step2_urls) else st.session_state.pipe_step2_url
+                    },
+                    "step3": {
+                        "model": step3_id, 
+                        "images": step3_urls,
+                        "selected_idx": step3_selected,
+                        "selected": step3_urls[step3_selected] if step3_urls and step3_selected < len(step3_urls) else st.session_state.pipe_step3_url
+                    },
                     "prompts": st.session_state.pipe_prompts,
+                    "image_size": image_size,
                 },
+                is_pipeline=True,
             )
 
             st.success("Pipeline complete.")
@@ -1142,7 +1401,7 @@ MODEL_OPTIONS = {
 }
 
 # -----------------------------
-# SIDEBAR "TABS" (side-by-side)
+# SIDEBAR HISTORY PREVIEW
 # -----------------------------
 with st.sidebar:
     st.markdown("### Navigation")
@@ -1161,6 +1420,145 @@ with st.sidebar:
         st.session_state.zoom_kind = None
         st.session_state.zoom_meta = None
         st.rerun()
+    
+    st.markdown("---")
+    st.markdown("### Generated Images")
+    
+    # Load and display history in sidebar
+    history = load_history()
+    if history:
+        # Sort by timestamp, newest first
+        history_sorted = sorted(history, key=lambda x: x.get("timestamp", ""), reverse=True)
+        
+        # Group by date
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for entry in history_sorted:
+            try:
+                ts = entry.get("timestamp", "")
+                if ts:
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    date_key = dt.strftime("%Y-%m-%d")
+                    by_date[date_key].append(entry)
+            except Exception:
+                # Fallback: use timestamp as-is
+                by_date.get("Unknown", []).append(entry)
+        
+        # Display each date group
+        for date_str in sorted(by_date.keys(), reverse=True):
+            entries = by_date[date_str]
+            
+            # Format date nicely
+            try:
+                dt = datetime.fromisoformat(date_str + "T00:00:00+00:00")
+                date_display = dt.strftime("%B %d, %Y")
+            except Exception:
+                date_display = date_str
+            
+            st.markdown(f"**{date_display}**")
+            
+            # Display each entry in this date
+            for entry in entries:
+                urls = entry.get("urls", [])
+                if not urls:
+                    continue
+                
+                meta = entry.get("meta", {}) or {}
+                is_pipeline = meta.get("is_pipeline", False)
+                aspect_ratio = meta.get("aspect_ratio") or "N/A"
+                resolution = meta.get("resolution") or "N/A"
+                model_label = entry.get("model_label", "Unknown")
+                
+                # Create expandable section for each image (expanded by default)
+                pipeline_badge = "🔗 Pipeline" if is_pipeline else "✨ Single"
+                expander_label = f"{pipeline_badge} | {aspect_ratio} | {resolution}"
+                
+                with st.expander(expander_label, expanded=True):  # Changed to expanded=True
+                    if is_pipeline:
+                        # For pipeline entries, show all steps
+                        pipeline_steps = [
+                            ("Step 1", meta.get("step1", {})),
+                            ("Step 2", meta.get("step2", {})),
+                            ("Step 3", meta.get("step3", {}))
+                        ]
+                        
+                        for step_idx, (step_label, step_data) in enumerate(pipeline_steps, 1):
+                            if not step_data:
+                                continue
+                            
+                            step_images = step_data.get("images") or []
+                            # Fallback: if images list is empty but we have a single image URL
+                            if not step_images:
+                                single_img = step_data.get("image") or step_data.get("selected")
+                                if single_img:
+                                    step_images = [single_img]
+                            
+                            if step_images:
+                                selected_url = step_data.get("selected")
+                                selected_idx = step_data.get("selected_idx", 0)
+                                
+                                st.markdown(f"**{step_label}** ({len(step_images)} image{'s' if len(step_images) > 1 else ''})")
+                                
+                                # Show all images in this step
+                                num_cols = min(len(step_images), 4)
+                                if num_cols > 0:
+                                    step_cols = st.columns(num_cols)
+                                    for img_idx, step_img_url in enumerate(step_images):
+                                        with step_cols[img_idx % num_cols]:
+                                            # Check if this image was selected
+                                            is_selected = False
+                                            if selected_url:
+                                                is_selected = (step_img_url == selected_url)
+                                            elif selected_idx is not None and img_idx == selected_idx:
+                                                is_selected = True
+                                            
+                                            # Visual indicator for selected image
+                                            if is_selected:
+                                                st.markdown(
+                                                    '<div style="border: 2px solid #FF4B4B; border-radius: 4px; padding: 2px; background: rgba(255, 75, 75, 0.1);">',
+                                                    unsafe_allow_html=True
+                                                )
+                                                st.caption("✅ Selected")
+                                            
+                                            try:
+                                                img_ref = _normalize_image_ref(step_img_url)
+                                                if img_ref:
+                                                    st.image(img_ref, width='stretch')
+                                                else:
+                                                    st.caption("⚠️ Unavailable")
+                                            except Exception:
+                                                st.caption("⚠️ Unavailable")
+                                            
+                                            if is_selected:
+                                                st.markdown("</div>", unsafe_allow_html=True)
+                                
+                                if step_idx < len(pipeline_steps):  # Add separator between steps (except after last)
+                                    st.markdown("---")
+                    else:
+                        # For single generation, show all images
+                        for img_idx, img_url in enumerate(urls):
+                            try:
+                                img_ref = _normalize_image_ref(img_url)
+                                if img_ref:
+                                    st.image(img_ref, width='stretch')
+                                else:
+                                    st.caption("⚠️ Image unavailable")
+                            except Exception as e:
+                                st.caption(f"⚠️ Image unavailable: {str(e)[:50]}")
+                            
+                            if len(urls) > 1 and img_idx < len(urls) - 1:
+                                st.markdown("---")
+                    
+                    # Metadata
+                    if aspect_ratio != "N/A":
+                        st.caption(f"**Aspect Ratio:** {aspect_ratio}")
+                    if resolution != "N/A":
+                        st.caption(f"**Resolution:** {resolution}")
+                    st.caption(f"**Type:** {'3-Step Pipeline' if is_pipeline else 'Single Generation'}")
+            
+            st.markdown("---")
+    else:
+        st.info("No generated images yet. Create something first!")
 
 # =========================================================
 # HISTORY PAGE
@@ -1186,9 +1584,22 @@ if st.session_state.page == "History":
     if st.session_state.zoom_url:
         st.markdown("### Preview")
         if st.session_state.zoom_kind == "image":
-            st.image(st.session_state.zoom_url, use_column_width=True)
+            st.image(st.session_state.zoom_url, width='stretch')
         else:
             st.video(st.session_state.zoom_url)
+        
+        # Show model name as small text (barely visible) at bottom right
+        zoom_meta = st.session_state.zoom_meta or {}
+        entry_for_model = None
+        for entry in history_sorted:
+            if any(url == st.session_state.zoom_url for url in entry.get("urls", [])):
+                entry_for_model = entry
+                break
+        model_label = entry_for_model.get("model_label", "Unknown Model") if entry_for_model else (zoom_meta.get("model_label") or "Unknown Model")
+        st.markdown(
+            f'<div style="text-align: right; opacity: 0.3; font-size: 9px; color: gray; margin-top: -10px;">{model_label}</div>',
+            unsafe_allow_html=True
+        )
 
         with st.expander("Details", expanded=False):
             st.json(st.session_state.zoom_meta or {})
@@ -1752,6 +2163,7 @@ if run_btn:
                     kind="video",
                     urls=[video_url],
                     meta={"seed": result.get("seed")},
+                    is_pipeline=False,
                 )
 
             # -------- NANO BANANA PRO --------
@@ -1790,6 +2202,7 @@ if run_btn:
                     kind="image",
                     urls=urls,
                     meta={"prompt": prompt.strip()},
+                    is_pipeline=False,
                 )
 
             # -------- NANO BANANA PRO EDIT --------
@@ -1829,6 +2242,7 @@ if run_btn:
                     kind="image",
                     urls=urls,
                     meta={"prompt": edit_prompt.strip()},
+                    is_pipeline=False,
                 )
 
 
@@ -1868,6 +2282,7 @@ if run_btn:
                     kind="image",
                     urls=urls,
                     meta={"prompt": gi_prompt.strip(), "image_size": gi_image_size, "quality": gi_quality},
+                    is_pipeline=False,
                 )
 
             # -------- GPT IMAGE 1.5 (FAL) EDIT --------
@@ -1913,6 +2328,7 @@ if run_btn:
                     kind="image",
                     urls=urls,
                     meta={"prompt": gi_edit_prompt.strip(), "image_size": gi_edit_image_size, "quality": gi_edit_quality},
+                    is_pipeline=False,
                 )
 
             # -------- OPENAI DIRECT GPT IMAGE 1.5 (T2I) --------
@@ -1947,6 +2363,7 @@ if run_btn:
                     kind="image",
                     urls=paths,
                     meta={"prompt": oai_prompt.strip(), "size": oai_size, "quality": oai_quality},
+                    is_pipeline=False,
                 )
 
             # -------- OPENAI DIRECT GPT IMAGE 1.5 (EDIT) --------
@@ -1989,6 +2406,7 @@ if run_btn:
                     kind="image",
                     urls=paths,
                     meta={"prompt": oai_edit_prompt.strip(), "size": oai_edit_size, "quality": oai_edit_quality},
+                    is_pipeline=False,
                 )
 
             # -------- SEEDREAM 4.0 T2I --------
@@ -2021,7 +2439,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd_prompt.strip()}, is_pipeline=False)
 
             # -------- SEEDREAM 4.0 EDIT --------
             elif selected_model_id == "fal-ai/bytedance/seedream/v4/edit":
@@ -2057,7 +2475,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd_edit_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd_edit_prompt.strip()}, is_pipeline=False)
 
             # -------- SEEDREAM 4.5 T2I --------
             elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/text-to-image":
@@ -2087,7 +2505,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd45_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd45_prompt.strip()}, is_pipeline=False)
 
             # -------- SEEDREAM 4.5 EDIT --------
             elif selected_model_id == "fal-ai/bytedance/seedream/v4.5/edit":
@@ -2121,7 +2539,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd45_edit_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": sd45_edit_prompt.strip()}, is_pipeline=False)
 
             # -------- FLUX PRO KONTEXT MAX MULTI --------
             elif selected_model_id == "fal-ai/flux-pro/kontext/max/multi":
@@ -2170,7 +2588,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": flux_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": flux_prompt.strip()}, is_pipeline=False)
 
             # -------- FLUX.2 PRO T2I --------
             elif selected_model_id == "fal-ai/flux-2-pro":
@@ -2204,7 +2622,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": f2_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": f2_prompt.strip()}, is_pipeline=False)
 
             # -------- FLUX.2 PRO EDIT --------
             elif selected_model_id == "fal-ai/flux-2-pro/edit":
@@ -2244,7 +2662,7 @@ if run_btn:
                 for i, url in enumerate(urls):
                     cols[i % len(cols)].image(url, use_column_width=True)
 
-                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": f2e_prompt.strip()})
+                add_history_item(selected_model_label, selected_model_id, "image", urls, {"prompt": f2e_prompt.strip()}, is_pipeline=False)
 
             # -------- IDEOGRAM V3 REFRAME --------
             elif selected_model_id == "fal-ai/ideogram/v3/reframe":
@@ -2316,6 +2734,7 @@ if run_btn:
                         "style": None if ideo_style == "(none)" else ideo_style,
                         "style_preset": (ideo_style_preset or "").strip() or None,
                     },
+                    is_pipeline=False,
                 )
 
             else:

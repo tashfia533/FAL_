@@ -125,5 +125,48 @@
       "size": "auto",
       "quality": "auto"
     }
+  },
+  {
+    "timestamp": "2025-12-26T12:20:39.487666+00:00",
+    "model_label": "Pipeline: Nano Banana Pro Edit (Image + Text → Image) → Nano Banana Pro Edit (Image + Text → Image) → Seedream 4.5 Edit (Image + Text → Image)",
+    "model": "pipeline",
+    "kind": "image",
+    "urls": [
+      "https://v3b.fal.media/files/b/0a87d95b/QrmcAB8z7yGEzNFyT0Df8_1c5e54cbd65d4df9bc89081ebc65cb5a.png"
+    ],
+    "meta": {
+      "prompt": "A photoreal cinematic frame from a gritty crime thriller. Nighttime in New York City: a narrow wet alley beside a Chinese shop in a slum block. A masked vigilante (face covered with a black cloth, eyes visible) steps into the alley, tense and ready to fight. The scene feels dangerous and real: neon Chinese signage flickers, steam rises from street vents, rain-slick ground reflects light. Camera is low and slightly tilted (Dutch angle), 28–35mm lens look. The moment is right before the first punch—anticipation, not action. Real textures: wet concrete, peeling posters, metal dumpsters, grime, fabric folds, subtle sweat. No cartoon look, no stylization, no anime. Keep it believable like a movie still.",
+      "step1": {
+        "model": "fal-ai/nano-banana-pro/edit",
+        "images": [
+          "https://v3b.fal.media/files/b/0a87d945/RDVd4BVubY-lWiXQQteuJ.png",
+          "https://v3b.fal.media/files/b/0a87d945/W9uUr6S8AwEAeM5Fn5AcL.png",
+          "https://v3b.fal.media/files/b/0a87d945/LEA3RgXtBb-sEy5Uc5bRr.png"
+        ]
+      },
+      "step2": {
+        "model": "fal-ai/nano-banana-pro/edit",
+        "image": "https://v3b.fal.media/files/b/0a87d951/JGWwQem7viaPhDVLVjtj7.png"
+      },
+      "step3": {
+        "model": "fal-ai/bytedance/seedream/v4.5/edit",
+        "image": "https://v3b.fal.media/files/b/0a87d95b/QrmcAB8z7yGEzNFyT0Df8_1c5e54cbd65d4df9bc89081ebc65cb5a.png"
+      },
+      "prompts": {
+        "enhanced_prompt": "A photoreal cinematic frame depicting a masked vigilante stepping into a narrow wet alley beside a Chinese shop in a gritty New York City slum, creating an atmosphere of tension and anticipation. The alley features flickering neon signs, steam rising from street vents, and rain-slicked ground reflecting ambient light. The camera is positioned at a low, slightly tilted angle, resembling a 28-35mm lens perspective just before a fight. Textures of wet concrete, peeling posters, and fabric folds emphasize realism.",
+        "step1_prompt": "Transform the reference image to create a narrow alleyway that captures the essence of a gritty New York scene. Adjust the composition to incorporate a masked vigilante, ensuring the alley features wet concrete and scattered elements like metal dumpsters and peeling posters. The neon Chinese signage can be integrated subtly in the background to avoid overwhelming the scene, while maintaining realism in the textures and environment.",
+        "step2_prompt": "Enhance the scene with nighttime cinematography, introducing low-key lighting to emphasize shadows and create a moody atmosphere. Implement a Dutch angle for the camera positioning and employ a 28-35mm lens effect to focus on the vigilante, achieving a shallow depth of field. Add subtle film grain for authenticity and adjust the color grading to capture gritty undertones while ensuring the neon signs are visible but not overpowering.",
+        "step3_prompt": "Finalize the image with detailed artifact cleanup, sharpening the micro-textures of the materials, from wet concrete to cloth in the vigilante's outfit. Enhance the reflections on the rain-slick ground, ensuring they feel natural within the ambient light environment. Adjust shadows and highlights for coherence, and incorporate atmospheric perspective to ground the image in photorealism, completing the transformation into a cinematic frame.",
+        "negative_prompt": "cartoon, anime, illustration, CGI, plastic, toy, kitsch, oversaturation, unrealistic shadows, flat textures, branding elements",
+        "notes": "- Step 1 aligns the alleyway with elements from the user prompt, emphasizing realism with detailed textures.\n- Step 2 applies nighttime lighting techniques with a focus on the vigilant figure and adds atmospheric properties through shading.\n- Step 3 refines details, ensuring the overall image maintains a gritty, believable movie still aesthetic."
+      },
+      "dimensions": {
+        "width": 2048,
+        "height": 2048
+      },
+      "aspect_ratio": "1:1",
+      "resolution": "2048x2048",
+      "is_pipeline": true
+    }
   }
 ]
